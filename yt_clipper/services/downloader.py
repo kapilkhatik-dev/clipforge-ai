@@ -1,0 +1,462 @@
+"""yt-dlp integration for bounded metadata inspection and video downloads."""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import re
+import subprocess
+import tempfile
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+from yt_dlp import YoutubeDL
+from yt_dlp.cookies import SUPPORTED_BROWSERS, SUPPORTED_KEYRINGS
+from yt_dlp.utils import YoutubeDLError as YtDlpError
+
+from ..domain.errors import DownloadError, DurationLimitError, MediaProbeError
+from ..domain.models import (
+    MAX_SOURCE_DURATION_SECONDS,
+    DownloadedVideo,
+    VideoMetadata,
+)
+from ..infrastructure.artifacts import atomic_write_text
+from ..infrastructure.media_tools import MediaTools, probe_media
+
+DownloadProgressHook = Callable[[dict[str, Any]], None]
+_YOUTUBE_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_MAX_THUMBNAIL_DOWNLOAD_BYTES = 10 * 1024**2
+LOGGER = logging.getLogger(__name__)
+
+
+def validate_source_duration(
+    duration_seconds: float | int | None,
+    maximum_seconds: int = MAX_SOURCE_DURATION_SECONDS,
+) -> float:
+    if duration_seconds is None:
+        raise DownloadError("YouTube did not report a valid video duration.")
+
+    try:
+        duration = float(duration_seconds)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DownloadError("YouTube did not report a valid video duration.") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise DownloadError("YouTube did not report a valid video duration.")
+    if duration > maximum_seconds:
+        actual_minutes = duration / 60
+        maximum_minutes = maximum_seconds / 60
+        raise DurationLimitError(
+            f"Video is {actual_minutes:.1f} minutes long; the current limit is "
+            f"{maximum_minutes:.0f} minutes. Nothing was downloaded."
+        )
+    return duration
+
+
+def validate_youtube_video_id(video_id: str) -> str:
+    if not _YOUTUBE_VIDEO_ID.fullmatch(video_id):
+        raise DownloadError("YouTube returned an invalid video identifier.")
+    return video_id
+
+
+def parse_cookies_from_browser(value: str | None) -> tuple[str, str | None, str | None, str | None] | None:
+    """Parse yt-dlp's common BROWSER[+KEYRING][:PROFILE][::CONTAINER] form."""
+    if not value:
+        return None
+
+    browser_and_profile, separator, container = value.partition("::")
+    browser_and_keyring, profile_separator, profile = browser_and_profile.partition(":")
+    browser, keyring_separator, keyring = browser_and_keyring.partition("+")
+    browser = browser.strip().casefold()
+    if not browser:
+        raise DownloadError("--cookies-from-browser requires a browser name.")
+    if browser not in SUPPORTED_BROWSERS:
+        raise DownloadError(f"Unsupported cookie browser '{browser}'.")
+
+    normalized_keyring = (
+        keyring.strip().upper() if keyring_separator and keyring.strip() else None
+    )
+    if normalized_keyring and normalized_keyring not in SUPPORTED_KEYRINGS:
+        raise DownloadError(f"Unsupported browser keyring '{keyring.strip()}'.")
+
+    return (
+        browser,
+        profile.strip() if profile_separator and profile.strip() else None,
+        normalized_keyring,
+        container.strip() if separator and container.strip() else None,
+    )
+
+
+class VideoDownloader:
+    def __init__(self, media_tools: MediaTools) -> None:
+        self._media_tools = media_tools
+
+    def _ensure_original_thumbnail(
+        self,
+        metadata: VideoMetadata,
+        work_dir: Path,
+        force: bool,
+    ) -> Path | None:
+        """Cache a normalized copy of YouTube's original thumbnail when available."""
+        destination = work_dir / "source-thumbnail.jpg"
+        if destination.is_file() and destination.stat().st_size > 0 and not force:
+            return destination
+
+        thumbnail_url = (metadata.thumbnail_url or "").strip()
+        parsed = urlparse(thumbnail_url)
+        hostname = (parsed.hostname or "").casefold()
+        if (
+            parsed.scheme.casefold() != "https"
+            or not hostname
+            or not (hostname == "ytimg.com" or hostname.endswith(".ytimg.com"))
+        ):
+            return destination if destination.is_file() else None
+
+        raw_path: Path | None = None
+        converted_path: Path | None = None
+        try:
+            request = Request(
+                thumbnail_url,
+                headers={"User-Agent": "Mozilla/5.0 Clipper/1.0"},
+            )
+            with urlopen(request, timeout=30) as response:  # noqa: S310 - host is restricted above
+                final_hostname = (
+                    urlparse(response.geturl()).hostname or ""
+                ).casefold()
+                if not (
+                    final_hostname == "ytimg.com"
+                    or final_hostname.endswith(".ytimg.com")
+                ):
+                    raise ValueError("thumbnail redirect left the trusted YouTube image host")
+                declared_size = int(response.headers.get("Content-Length") or 0)
+                if declared_size > _MAX_THUMBNAIL_DOWNLOAD_BYTES:
+                    raise ValueError("thumbnail exceeds the 10 MiB download limit")
+                with tempfile.NamedTemporaryFile(
+                    prefix="source-thumbnail-",
+                    suffix=".download",
+                    dir=work_dir,
+                    delete=False,
+                ) as temporary:
+                    raw_path = Path(temporary.name)
+                    downloaded = 0
+                    while chunk := response.read(64 * 1024):
+                        downloaded += len(chunk)
+                        if downloaded > _MAX_THUMBNAIL_DOWNLOAD_BYTES:
+                            raise ValueError("thumbnail exceeds the 10 MiB download limit")
+                        temporary.write(chunk)
+            if not raw_path or raw_path.stat().st_size == 0:
+                raise ValueError("thumbnail download was empty")
+
+            with tempfile.NamedTemporaryFile(
+                prefix="source-thumbnail-",
+                suffix=".jpg",
+                dir=work_dir,
+                delete=False,
+            ) as converted:
+                converted_path = Path(converted.name)
+            converted_path.unlink(missing_ok=True)
+            subprocess.run(
+                [
+                    str(self._media_tools.ffmpeg),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    str(raw_path),
+                    "-vf",
+                    (
+                        "scale=1280:720:force_original_aspect_ratio=increase:"
+                        "flags=lanczos,crop=1280:720,setsar=1"
+                    ),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    str(converted_path),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=60,
+            )
+            if not converted_path.is_file() or converted_path.stat().st_size == 0:
+                raise ValueError("FFmpeg did not create a normalized thumbnail")
+            os.replace(converted_path, destination)
+            return destination
+        except (
+            OSError,
+            ValueError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            LOGGER.warning("Could not cache the original video thumbnail: %s", exc)
+            return destination if destination.is_file() else None
+        finally:
+            if raw_path:
+                raw_path.unlink(missing_ok=True)
+            if converted_path:
+                converted_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _common_options(cookies_from_browser: str | None) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "socket_timeout": 30,
+        }
+        parsed_cookies = parse_cookies_from_browser(cookies_from_browser)
+        if parsed_cookies:
+            options["cookiesfrombrowser"] = parsed_cookies
+        return options
+
+    def inspect(
+        self,
+        url: str,
+        cookies_from_browser: str | None = None,
+        maximum_duration_seconds: int = MAX_SOURCE_DURATION_SECONDS,
+    ) -> VideoMetadata:
+        options = self._common_options(cookies_from_browser)
+        options["skip_download"] = True
+
+        try:
+            with YoutubeDL(options) as ydl:  # pyright: ignore[reportArgumentType]
+                info = ydl.extract_info(url, download=False)
+        except YtDlpError as exc:
+            raise DownloadError(f"Could not inspect the YouTube video: {exc}") from exc
+
+        if not info or info.get("_type") in {"playlist", "multi_video"} or info.get("entries"):
+            raise DownloadError("Only a single YouTube video URL is supported.")
+
+        extractor_key = str(info.get("extractor_key") or "")
+        if not extractor_key.casefold().startswith("youtube"):
+            raise DownloadError("Only YouTube video URLs are supported.")
+
+        duration = validate_source_duration(
+            info.get("duration"),
+            maximum_seconds=maximum_duration_seconds,
+        )
+        video_id = validate_youtube_video_id(str(info.get("id") or "").strip())
+        title = str(info.get("title") or "").strip()
+        if not video_id or not title:
+            raise DownloadError("YouTube returned incomplete video metadata.")
+
+        return VideoMetadata(
+            video_id=video_id,
+            source_url=str(info.get("webpage_url") or url),
+            title=title,
+            duration_seconds=duration,
+            uploader=info.get("uploader") or info.get("channel"),
+            upload_date=info.get("upload_date"),
+            thumbnail_url=info.get("thumbnail"),
+        )
+
+    def download(
+        self,
+        metadata: VideoMetadata,
+        output_root: Path,
+        cookies_from_browser: str | None = None,
+        force: bool = False,
+        progress_hook: DownloadProgressHook | None = None,
+        maximum_duration_seconds: int = MAX_SOURCE_DURATION_SECONDS,
+        maximum_download_bytes: int = 4 * 1024**3,
+    ) -> DownloadedVideo:
+        validate_source_duration(
+            metadata.duration_seconds,
+            maximum_seconds=maximum_duration_seconds,
+        )
+        video_id = validate_youtube_video_id(metadata.video_id)
+        output_root = output_root.expanduser().resolve()
+        work_dir = (output_root / video_id).resolve()
+        if work_dir.parent != output_root:
+            raise DownloadError("Unsafe output directory derived from video metadata.")
+        work_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path = work_dir / "metadata.json"
+        video_path = work_dir / "source.mp4"
+        thumbnail_path = self._ensure_original_thumbnail(metadata, work_dir, force)
+
+        if video_path.is_file() and not force:
+            try:
+                probe = probe_media(self._media_tools, video_path)
+                duration_matches = abs(probe.duration_seconds - metadata.duration_seconds) <= 5
+                within_mux_tolerance = (
+                    probe.duration_seconds <= maximum_duration_seconds + 5
+                )
+                size_is_safe = video_path.stat().st_size <= maximum_download_bytes
+                if (
+                    probe.has_video
+                    and probe.has_audio
+                    and duration_matches
+                    and within_mux_tolerance
+                    and size_is_safe
+                ):
+                    atomic_write_text(
+                        metadata_path, metadata.model_dump_json(indent=2)
+                    )
+                    return DownloadedVideo(
+                        metadata=metadata,
+                        video_path=video_path,
+                        metadata_path=metadata_path,
+                        work_dir=work_dir,
+                        thumbnail_path=thumbnail_path,
+                    )
+            except (DurationLimitError, MediaProbeError, OSError):
+                pass
+            video_path.unlink(missing_ok=True)
+
+        if force:
+            for existing in work_dir.glob("source.*"):
+                if existing.is_file():
+                    existing.unlink()
+
+        duration_rejection: list[DownloadError] = []
+        size_rejection: list[DownloadError] = []
+        downloaded_by_file: dict[str, int] = {}
+
+        def duration_filter(info: dict[str, Any], *, incomplete: bool) -> str | None:
+            if incomplete and info.get("duration") is None:
+                return None
+            try:
+                validate_source_duration(
+                    info.get("duration"),
+                    maximum_seconds=maximum_duration_seconds,
+                )
+            except DownloadError as exc:
+                duration_rejection.append(exc)
+                return str(exc)
+            return None
+
+        def bounded_progress(status: dict[str, Any]) -> None:
+            if status.get("status") in {"downloading", "finished"}:
+                info = status.get("info_dict")
+                format_id = info.get("format_id") if isinstance(info, dict) else None
+                transfer_key = str(
+                    format_id
+                    or status.get("filename")
+                    or status.get("tmpfilename")
+                    or "download"
+                )
+                transferred = max(
+                    int(status.get("downloaded_bytes") or 0),
+                    int(status.get("total_bytes") or 0),
+                    int(status.get("total_bytes_estimate") or 0),
+                )
+                downloaded_by_file[transfer_key] = max(
+                    downloaded_by_file.get(transfer_key, 0),
+                    transferred,
+                )
+                if sum(downloaded_by_file.values()) > maximum_download_bytes:
+                    error = DownloadError(
+                        "Downloaded streams exceed the configured source-size limit."
+                    )
+                    size_rejection.append(error)
+                    raise error
+            if progress_hook:
+                progress_hook(status)
+
+        options = self._common_options(cookies_from_browser)
+        options.update(
+            {
+                "format": (
+                    "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                    "best[height<=1080][ext=mp4]"
+                ),
+                "outtmpl": str(work_dir / "source.%(ext)s"),
+                "merge_output_format": "mp4",
+                "ffmpeg_location": self._media_tools.yt_dlp_location,
+                "overwrites": force,
+                "continuedl": True,
+                "noprogress": True,
+                "match_filter": duration_filter,
+                "break_on_reject": True,
+                "max_filesize": maximum_download_bytes,
+                "concurrent_fragment_downloads": 2,
+            }
+        )
+        options["progress_hooks"] = [bounded_progress]
+
+        try:
+            with YoutubeDL(options) as ydl:  # pyright: ignore[reportArgumentType]
+                downloaded_info = ydl.extract_info(metadata.source_url, download=True)
+        except (YtDlpError, DownloadError) as exc:
+            for partial in work_dir.glob("source.*"):
+                if partial.is_file():
+                    partial.unlink(missing_ok=True)
+            if duration_rejection:
+                raise duration_rejection[-1] from exc
+            if size_rejection:
+                raise size_rejection[-1] from exc
+            if isinstance(exc, DownloadError):
+                raise
+            raise DownloadError(f"Video download failed: {exc}") from exc
+
+        if duration_rejection:
+            raise duration_rejection[-1]
+        if size_rejection:
+            raise size_rejection[-1]
+        if downloaded_info:
+            try:
+                validate_source_duration(
+                    downloaded_info.get("duration"),
+                    maximum_seconds=maximum_duration_seconds,
+                )
+            except DownloadError:
+                for partial in work_dir.glob("source.*"):
+                    if partial.is_file():
+                        partial.unlink(missing_ok=True)
+                raise
+
+        if not video_path.is_file():
+            possible_outputs = [
+                path
+                for path in work_dir.glob("source.*")
+                if path.is_file() and path.suffix.lower() not in {".part", ".ytdl"}
+            ]
+            if len(possible_outputs) == 1 and possible_outputs[0].suffix.lower() == ".mp4":
+                video_path = possible_outputs[0]
+            else:
+                raise DownloadError(
+                    "yt-dlp completed but did not produce the expected source.mp4 file."
+                )
+
+        try:
+            probe = probe_media(self._media_tools, video_path)
+        except MediaProbeError as exc:
+            video_path.unlink(missing_ok=True)
+            raise DownloadError(f"Downloaded media failed validation: {exc}") from exc
+        if not probe.has_video or not probe.has_audio:
+            video_path.unlink(missing_ok=True)
+            raise DownloadError(
+                "Downloaded media must contain both video and audio streams."
+            )
+        if (
+            probe.duration_seconds > maximum_duration_seconds + 5
+            or abs(probe.duration_seconds - metadata.duration_seconds) > 5
+        ):
+            video_path.unlink(missing_ok=True)
+            raise DownloadError("Downloaded media duration does not match its metadata.")
+        try:
+            source_size = video_path.stat().st_size
+        except OSError as exc:
+            video_path.unlink(missing_ok=True)
+            raise DownloadError(f"Could not inspect downloaded media size: {exc}") from exc
+        if source_size > maximum_download_bytes:
+            video_path.unlink(missing_ok=True)
+            raise DownloadError(
+                "Downloaded media exceeds the configured source-size limit."
+            )
+
+        atomic_write_text(metadata_path, metadata.model_dump_json(indent=2))
+        return DownloadedVideo(
+            metadata=metadata,
+            video_path=video_path,
+            metadata_path=metadata_path,
+            work_dir=work_dir,
+            thumbnail_path=thumbnail_path,
+        )

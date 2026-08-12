@@ -13,9 +13,11 @@ from litellm import completion
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..config import (
+    ContentType,
     DEFAULT_ANALYSIS_MODEL,
     LLMProvider,
     default_analysis_model,
+    normalize_content_type,
     normalize_llm_provider,
 )
 from ..domain.errors import AnalysisError
@@ -54,6 +56,76 @@ _STRUCTURED_TOOL_MODELS = frozenset(
         _ANTHROPIC_DEFAULT_MODEL,
     }
 )
+
+_CONTENT_TYPE_GUIDANCE: dict[ContentType, str] = {
+    ContentType.AUTO: (
+        "Infer the dominant content type from the transcript before ranking moments, "
+        "then apply the editorial standards best suited to that genre. Perform this "
+        "inference inside the clip-selection task; do not return a separate "
+        "classification or add invented context."
+    ),
+    ContentType.GENERAL: (
+        "Use general short-form editorial judgment: prioritize a strong opening, "
+        "standalone clarity, a meaningful payoff, and high viewer interest."
+    ),
+    ContentType.COMEDY: (
+        "The video is explicitly categorized as comedy. Prioritize the funniest "
+        "standalone moments: complete joke arcs with setup, escalation, punchline, "
+        "and a tightly connected immediate reaction when it improves the payoff. "
+        "Weight laugh density, surprise, timing, quotability, and replay value while "
+        "still requiring context-free clarity. Reject setup without its punchline, "
+        "a punchline that depends on missing setup, isolated laughter or reactions, "
+        "and callbacks whose source is outside the clip. Use accurate, concise titles "
+        "that create curiosity without unnecessarily spoiling the joke."
+    ),
+    ContentType.INTERVIEW: (
+        "Prioritize self-contained questions and answers, revealing admissions, sharp "
+        "opinions, surprising personal details, and complete exchanges with a clear "
+        "answer or insight."
+    ),
+    ContentType.PODCAST: (
+        "Prioritize complete conversational insights, compelling anecdotes, useful "
+        "debates, surprising claims, and quotable exchanges that make sense without "
+        "the surrounding episode."
+    ),
+    ContentType.EDUCATION: (
+        "Prioritize complete explanations, memorable facts, practical steps, useful "
+        "examples, and misconception corrections that leave the viewer with one clear "
+        "lesson."
+    ),
+    ContentType.STORYTELLING: (
+        "Prioritize complete story beats with enough setup, rising interest, and a "
+        "resolution, reveal, or emotional turn. Reject fragments that depend on an "
+        "earlier character or event introduction."
+    ),
+    ContentType.NEWS: (
+        "Prioritize consequential, timely claims with the necessary subject, evidence, "
+        "and conclusion. Avoid sensational fragments that omit essential qualification "
+        "or attribution."
+    ),
+    ContentType.COMMENTARY: (
+        "Prioritize a clear claim supported by reasoning, a sharp observation, or a "
+        "complete reaction whose target and conclusion are explicit."
+    ),
+    ContentType.GAMING: (
+        "Prioritize decisive gameplay moments, surprising outcomes, skilled plays, "
+        "funny failures, and reactions that include enough lead-in to understand what "
+        "happened and why it matters."
+    ),
+    ContentType.SPORTS: (
+        "Prioritize decisive plays, turning points, analysis, rivalry moments, and "
+        "emotional reactions with enough context to identify the situation and payoff."
+    ),
+    ContentType.BUSINESS: (
+        "Prioritize actionable lessons, counterintuitive decisions, concrete examples, "
+        "mistakes, results, and complete strategic insights rather than vague advice."
+    ),
+}
+
+
+def _content_type_guidance(content_type: ContentType | str) -> tuple[ContentType, str]:
+    resolved = normalize_content_type(content_type)
+    return resolved, _CONTENT_TYPE_GUIDANCE[resolved]
 
 
 class ChunkAnalysisDocument(BaseModel):
@@ -177,6 +249,7 @@ def _chunk_fingerprint(
     min_duration: float,
     max_duration: float,
     video_duration: float,
+    content_type: ContentType,
 ) -> str:
     return fingerprint_payload(
         {
@@ -187,6 +260,7 @@ def _chunk_fingerprint(
             "min_duration": min_duration,
             "max_duration": max_duration,
             "video_duration": video_duration,
+            "content_type": content_type.value,
             "segments": [segment.model_dump(mode="json") for segment in chunk],
         }
     )
@@ -730,6 +804,7 @@ class TranscriptAnalyzer:
         min_duration: float,
         max_duration: float,
         *,
+        content_type: ContentType | str = ContentType.AUTO,
         cache_dir: Path | None = None,
         force: bool = False,
         chunk_max_characters: int = 45_000,
@@ -750,6 +825,7 @@ class TranscriptAnalyzer:
             raise AnalysisError(
                 "Transcript chunk overlap cannot be shorter than the maximum clip duration."
             )
+        resolved_content_type, _ = _content_type_guidance(content_type)
 
         chunks = chunk_transcript(
             transcript.segments,
@@ -777,6 +853,7 @@ class TranscriptAnalyzer:
             request_max_attempts=request_max_attempts,
             progress_callback=progress_callback,
             analysis_backend=self.analysis_backend_id(model),
+            content_type=resolved_content_type,
         )
 
         if all(not candidates for candidates in chunk_results):
@@ -812,6 +889,7 @@ class TranscriptAnalyzer:
                     max_duration=max_duration,
                     request_max_attempts=request_max_attempts,
                     allow_empty=True,
+                    content_type=resolved_content_type,
                 )
             )
 
@@ -842,6 +920,7 @@ class TranscriptAnalyzer:
         max_concurrency: int,
         request_max_attempts: int,
         progress_callback: AnalysisChunkProgressCallback | None,
+        content_type: ContentType = ContentType.AUTO,
         analysis_backend: str | None = None,
     ) -> list[list[ClipCandidate]]:
         if cache_dir:
@@ -864,6 +943,7 @@ class TranscriptAnalyzer:
                     force=force,
                     request_max_attempts=request_max_attempts,
                     analysis_backend=analysis_backend or model,
+                    content_type=content_type,
                 ),
             )
 
@@ -942,6 +1022,7 @@ class TranscriptAnalyzer:
         force: bool,
         request_max_attempts: int,
         analysis_backend: str,
+        content_type: ContentType,
     ) -> list[ClipCandidate]:
         fingerprint = _chunk_fingerprint(
             chunk,
@@ -950,6 +1031,7 @@ class TranscriptAnalyzer:
             min_duration,
             max_duration,
             video_duration,
+            content_type,
         )
         cache_path = cache_dir / f"chunk-{index + 1:03d}.json" if cache_dir else None
         if cache_path and cache_path.is_file() and not force:
@@ -984,6 +1066,7 @@ class TranscriptAnalyzer:
             min_duration=min_duration,
             max_duration=max_duration,
             request_max_attempts=request_max_attempts,
+            content_type=content_type,
         )
         if cache_path:
             document = ChunkAnalysisDocument(
@@ -1108,11 +1191,16 @@ class TranscriptAnalyzer:
         min_duration: float,
         max_duration: float,
         request_max_attempts: int,
+        content_type: ContentType,
     ) -> list[ClipCandidate]:
+        resolved_content_type, editorial_guidance = _content_type_guidance(content_type)
         transcript_text = "\n".join(_format_transcript_line(segment) for segment in chunk)
         prompt = f"""You are the first-pass editor for a timestamped transcript.
 Use the submit_clip_candidates tool when available. Otherwise return one compact
 JSON object with a "clips" array and no Markdown or commentary.
+
+Content-type focus ({resolved_content_type.value}):
+{editorial_guidance}
 
 Find compelling excerpts, but completeness is more important than quantity.
 Each candidate must be one coherent thought or topic that a new viewer can fully
@@ -1149,7 +1237,8 @@ Timestamped transcript:
         return self._request_candidates(
             prompt=prompt,
             system_message=(
-                "Find complete, independently understandable excerpts. Prefer fewer "
+                f"The configured content type is '{resolved_content_type.value}'. "
+                + "Find complete, independently understandable excerpts. Prefer fewer "
                 + "clips over context-dependent or abruptly cut clips. Use the requested "
                 + "tool when available; otherwise return strict JSON only."
             ),
@@ -1182,7 +1271,9 @@ Timestamped transcript:
         max_duration: float,
         request_max_attempts: int,
         allow_empty: bool = False,
+        content_type: ContentType = ContentType.AUTO,
     ) -> list[ClipCandidate]:
+        resolved_content_type, editorial_guidance = _content_type_guidance(content_type)
         review_context = "\n\n".join(
             _format_candidate_review_context(
                 candidate,
@@ -1195,6 +1286,9 @@ Timestamped transcript:
 Review the proposed clips against the transcript shown before, inside, and after
 each boundary. Return only clips that are genuinely standalone. You may adjust
 start/end timestamps to exact displayed segment boundaries or reject a proposal.
+
+Content-type focus ({resolved_content_type.value}):
+{editorial_guidance}
 
 A clip passes only when all of these are true:
 - It covers exactly one complete thought, story beat, explanation, or topic.
@@ -1231,7 +1325,8 @@ PROPOSED CLIPS AND CONTEXT:
         return self._request_candidates(
             prompt=prompt,
             system_message=(
-                "Act as a strict continuity editor. Approve only clips that begin with "
+                f"The configured content type is '{resolved_content_type.value}'. "
+                + "Act as a strict continuity editor. Approve only clips that begin with "
                 + "sufficient setup and end after a complete resolution. Reject ambiguous "
                 + "or abruptly cut excerpts. Return tool data or strict JSON only."
             ),

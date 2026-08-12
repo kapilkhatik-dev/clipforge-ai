@@ -12,6 +12,7 @@ from yt_clipper.domain.models import (
     DownloadedVideo,
     TranscriptOrigin,
     TranscriptSegment,
+    TranscriptMode,
     VideoMetadata,
     WhisperDevice,
 )
@@ -184,6 +185,57 @@ def test_oversized_caption_response_has_actionable_error(
         )
 
     assert read_sizes == [limit + 1]
+
+
+def test_local_video_uses_matching_automatic_sidecar_captions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    local_source = tmp_path / "Comedy [local].mp4"
+    local_source.write_bytes(b"original-local-video")
+    sidecar = tmp_path / "Comedy [local].en-auto.srt"
+    sidecar.write_text(
+        "1\n00:00:01,000 --> 00:00:04,000\nA complete funny setup.\n\n"
+        "2\n00:00:04,000 --> 00:00:08,000\nAnd this is the punchline.\n",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "output" / "local-video"
+    work_dir.mkdir(parents=True)
+    staged_source = work_dir / "source.mp4"
+    staged_source.write_bytes(local_source.read_bytes())
+    video = DownloadedVideo(
+        metadata=VideoMetadata(
+            video_id="local-video",
+            source_url=str(local_source),
+            title="Comedy",
+            duration_seconds=10,
+        ),
+        video_path=staged_source,
+        metadata_path=work_dir / "metadata.json",
+        work_dir=work_dir,
+    )
+    service = TranscriptService(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+    monkeypatch.setattr(
+        service,
+        "_from_whisper",
+        lambda **_kwargs: pytest.fail("A valid sidecar must avoid Whisper"),
+    )
+
+    transcript, transcript_path = service.get_transcript(
+        video,
+        language="en",
+        mode=TranscriptMode.CAPTIONS,
+    )
+
+    assert transcript.origin == TranscriptOrigin.AUTOMATIC
+    assert transcript.language == "en-auto"
+    assert [segment.text for segment in transcript.segments] == [
+        "A complete funny setup.",
+        "And this is the punchline.",
+    ]
+    assert transcript_path.is_file()
 
 
 def test_whisper_lock_covers_pcm_extraction_and_transcription(

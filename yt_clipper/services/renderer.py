@@ -33,6 +33,8 @@ _CAPTION_OVERLAP_TOLERANCE_SECONDS = 0.01
 _MIN_CAPTION_DURATION_SECONDS = 0.05
 _THUMBNAIL_WIDTH = 1280
 _THUMBNAIL_HEIGHT = 720
+_POSTER_WIDTH = 1080
+_POSTER_HEIGHT = 1920
 
 
 @dataclass(frozen=True)
@@ -269,11 +271,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + "\n".join(events) + ("\n" if events else "")
 
 
-def _balanced_title_lines(title: str, maximum_lines: int = 3) -> list[str]:
+def _balanced_title_lines(
+    title: str,
+    maximum_lines: int = 3,
+    one_line_limit: int = 26,
+    target_line_length: int = 31,
+) -> list[str]:
     words = title.split()
     if not words:
         return []
-    preferred_lines = 1 if len(title) <= 26 else 2 if len(title) <= 62 else 3
+    preferred_lines = (
+        1
+        if len(title) <= one_line_limit
+        else max(2, math.ceil(len(title) / target_line_length))
+    )
     line_count = min(maximum_lines, preferred_lines)
     line_count = min(line_count, len(words))
     lines: list[str] = []
@@ -341,6 +352,73 @@ def build_thumbnail_filter_graph(
         f"drawbox=x=0:y={panel_top}:w=iw:h={panel_height}:color=black@0.72:t=fill,"
         f"drawbox=x=72:y={accent_y}:w=118:h=7:color=0xFFDF17@1:t=fill,"
         "subtitles=filename='thumbnail-title.ass'"
+    )
+
+
+def build_vertical_poster_ass_document(
+    title: str,
+    width: int = _POSTER_WIDTH,
+    height: int = _POSTER_HEIGHT,
+    font_name: str = "Arial",
+) -> str:
+    lines = _balanced_title_lines(
+        _escape_ass_text(title),
+        maximum_lines=5,
+        one_line_limit=17,
+        target_line_length=18,
+    )
+    wrapped_title = r"\N".join(lines)
+    longest_line = max((len(line) for line in lines), default=0)
+    if longest_line <= 16:
+        font_size = 108
+    elif longest_line <= 20:
+        font_size = 96
+    elif longest_line <= 24:
+        font_size = 84
+    elif longest_line <= 28:
+        font_size = 72
+    else:
+        font_size = 62
+    title_top = round(height * 0.54)
+    return f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+Kerning: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: PosterTitle,{font_name},{font_size},&H00FFFFFF,&H00FFFFFF,&H00101010,&H70000000,-1,0,0,0,100,100,0.4,0,1,4,2.5,7,84,84,{title_top},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:10.00,PosterTitle,,0,0,0,,{wrapped_title}
+"""
+
+
+def build_vertical_poster_filter_graph(
+    width: int = _POSTER_WIDTH,
+    height: int = _POSTER_HEIGHT,
+) -> str:
+    panel_top = round(height * 0.42)
+    accent_y = panel_top + 92
+    artwork_y = 0
+    artwork_box_height = round(height * 0.40)
+    return (
+        "[0:v]split=2[poster_background][poster_artwork];"
+        f"[poster_background]scale={width}:{height}:"
+        "force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={width}:{height},gblur=sigma=42,"
+        "eq=brightness=-0.32:saturation=0.78,setsar=1[background];"
+        f"[poster_artwork]scale={width}:{artwork_box_height}:"
+        "force_original_aspect_ratio=decrease:flags=lanczos,setsar=1[artwork];"
+        f"[background][artwork]overlay=(W-w)/2:{artwork_y}[canvas];"
+        f"[canvas]drawbox=x=0:y={panel_top}:w=iw:h={height - panel_top}:"
+        "color=black@0.76:t=fill,"
+        f"drawbox=x=84:y={accent_y}:w=150:h=9:color=0xFFDF17@1:t=fill,"
+        "subtitles=filename='poster-title.ass'[poster]"
     )
 
 
@@ -438,6 +516,131 @@ class ClipRenderer:
         except (OSError, ValueError, MediaProbeError, json.JSONDecodeError):
             return False
 
+    @staticmethod
+    def _poster_fingerprint(
+        video: DownloadedVideo,
+        candidate: ClipCandidate,
+    ) -> str:
+        source = (
+            video.thumbnail_path
+            if video.thumbnail_path and video.thumbnail_path.is_file()
+            else video.video_path
+        )
+        return fingerprint_payload(
+            {
+                "schema_version": 1,
+                "source": fingerprint_file(source),
+                "source_kind": (
+                    "original-thumbnail"
+                    if source != video.video_path
+                    else "fallback-source-frame"
+                ),
+                "candidate": candidate.model_dump(mode="json"),
+                "poster_style": "vertical-original-artwork-title-panel-v2",
+                "width": _POSTER_WIDTH,
+                "height": _POSTER_HEIGHT,
+            }
+        )
+
+    def _ensure_vertical_poster(
+        self,
+        video: DownloadedVideo,
+        candidate: ClipCandidate,
+        output_path: Path,
+        manifest_path: Path,
+        force: bool,
+    ) -> Path:
+        poster_path = output_path.with_suffix(".poster.jpg")
+        try:
+            poster_fingerprint = self._poster_fingerprint(video, candidate)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("render manifest must be a JSON object")
+            if (
+                not force
+                and poster_path.is_file()
+                and manifest.get("poster_fingerprint") == poster_fingerprint
+                and manifest.get("poster_output_fingerprint")
+                == fingerprint_file(poster_path)
+            ):
+                return poster_path
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RenderError(f"Could not initialize vertical poster: {exc}") from exc
+
+        temp_root = video.work_dir / "temp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="poster-", dir=temp_root) as temp:
+            temp_dir = Path(temp)
+            poster_title_path = temp_dir / "poster-title.ass"
+            temporary_poster = temp_dir / "poster.jpg"
+            poster_title_path.write_text(
+                build_vertical_poster_ass_document(candidate.title),
+                encoding="utf-8-sig",
+            )
+            poster_source = (
+                video.thumbnail_path
+                if video.thumbnail_path and video.thumbnail_path.is_file()
+                else video.video_path
+            )
+            command = [
+                str(self._media_tools.ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+            ]
+            if poster_source == video.video_path:
+                command.extend(["-ss", f"{candidate.start + candidate.duration / 2:.3f}"])
+            command.extend(
+                [
+                    "-i",
+                    str(poster_source.resolve()),
+                    "-filter_complex",
+                    build_vertical_poster_filter_graph(),
+                    "-map",
+                    "[poster]",
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    str(temporary_poster),
+                ]
+            )
+            try:
+                subprocess.run(
+                    command,
+                    cwd=temp_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                )
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                stderr = getattr(exc, "stderr", "") or ""
+                relevant_error = "\n".join(stderr.strip().splitlines()[-12:])
+                raise RenderError(
+                    "FFmpeg failed while creating the vertical poster: "
+                    f"{relevant_error or exc}"
+                ) from exc
+            if not temporary_poster.is_file():
+                raise RenderError("FFmpeg did not create the vertical poster.")
+            os.replace(temporary_poster, poster_path)
+
+        manifest["poster_fingerprint"] = poster_fingerprint
+        manifest["poster_output_fingerprint"] = fingerprint_file(poster_path)
+        atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, indent=2, sort_keys=True),
+        )
+        return poster_path
+
     def render(
         self,
         video: DownloadedVideo,
@@ -467,6 +670,13 @@ class ClipRenderer:
             render_fingerprint,
             candidate.duration,
         ):
+            self._ensure_vertical_poster(
+                video,
+                candidate,
+                output_path,
+                manifest_path,
+                force=False,
+            )
             return output_path
         output_path.unlink(missing_ok=True)
         thumbnail_path.unlink(missing_ok=True)
@@ -681,6 +891,13 @@ class ClipRenderer:
                 json.dumps(manifest, indent=2, sort_keys=True),
             )
 
+        self._ensure_vertical_poster(
+            video,
+            candidate,
+            output_path,
+            manifest_path,
+            force=force,
+        )
         return output_path
 
     @staticmethod
@@ -688,7 +905,13 @@ class ClipRenderer:
         retained = {path.resolve() for path in retained_paths}
         retained.update(path.with_suffix(".render.json") for path in retained_paths)
         retained.update(path.with_suffix(".thumbnail.jpg") for path in retained_paths)
-        for pattern in ("*.mp4", "*.render.json", "*.thumbnail.jpg"):
+        retained.update(path.with_suffix(".poster.jpg") for path in retained_paths)
+        for pattern in (
+            "*.mp4",
+            "*.render.json",
+            "*.thumbnail.jpg",
+            "*.poster.jpg",
+        ):
             for path in output_dir.glob(pattern):
                 if path.resolve() not in retained:
                     path.unlink(missing_ok=True)

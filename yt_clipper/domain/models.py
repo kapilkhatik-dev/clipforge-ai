@@ -17,12 +17,15 @@ from pydantic import (
 )
 
 from ..config import (
+    ContentType,
     LLMProvider,
     normalize_analysis_model,
+    normalize_content_type,
     normalize_llm_provider,
     resolve_analysis_model,
     resolve_codex_binary,
     resolve_codex_timeout_seconds,
+    resolve_content_type,
     resolve_llm_api_key,
     resolve_llm_provider,
 )
@@ -30,8 +33,8 @@ from ..config import (
 MAX_SOURCE_DURATION_SECONDS: Final[int] = 60 * 60
 MAX_CLIP_DURATION_SECONDS: Final[int] = 60
 MAX_CLIP_COUNT: Final[int] = 20
-ANALYSIS_SCHEMA_VERSION: Final[int] = 6
-ANALYSIS_PROMPT_VERSION: Final[int] = 2
+ANALYSIS_SCHEMA_VERSION: Final[int] = 7
+ANALYSIS_PROMPT_VERSION: Final[int] = 3
 
 
 def _resolve_default_llm_api_key() -> SecretStr | None:
@@ -107,6 +110,10 @@ class PipelineConfig(StrictModel):
         le=16 * 1024**3,
     )
     clip_count: int | None = Field(default=None, ge=1, le=MAX_CLIP_COUNT)
+    content_type: ContentType = Field(
+        default_factory=resolve_content_type,
+        validate_default=True,
+    )
     min_clip_duration: float = Field(
         default=20.0,
         ge=5.0,
@@ -167,6 +174,13 @@ class PipelineConfig(StrictModel):
         if isinstance(provider, (LLMProvider, str)):
             return normalize_llm_provider(provider)
         return provider
+
+    @field_validator("content_type", mode="before")
+    @classmethod
+    def normalize_editorial_content_type(cls, content_type: object) -> object:
+        if isinstance(content_type, (ContentType, str)):
+            return normalize_content_type(content_type)
+        return content_type
 
     @field_validator("model")
     @classmethod
@@ -301,6 +315,7 @@ class AnalysisDocument(StrictModel):
     model: str
     analysis_backend: str | None = Field(default=None, min_length=1)
     clip_count: int | None = Field(default=None, ge=1, le=MAX_CLIP_COUNT)
+    content_type: ContentType = ContentType.AUTO
     min_clip_duration: float
     max_clip_duration: float
     analysis_prompt_version: int
@@ -331,3 +346,4 @@ class PipelineResult(StrictModel):
     candidates_path: Path
     clip_paths: list[Path] = Field(default_factory=list)
     thumbnail_paths: list[Path] = Field(default_factory=list)
+    poster_paths: list[Path] = Field(default_factory=list)

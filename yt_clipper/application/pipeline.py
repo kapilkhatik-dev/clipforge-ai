@@ -141,6 +141,7 @@ class ClipPipeline:
                 and (cached.analysis_backend or cached.model)
                 == self._analysis_backend_id()
                 and cached.clip_count == self.config.clip_count
+                and cached.content_type == self.config.content_type
                 and cached.min_clip_duration == self.config.min_clip_duration
                 and cached.max_clip_duration == self.config.max_clip_duration
                 and cached.analysis_prompt_version == ANALYSIS_PROMPT_VERSION
@@ -250,11 +251,17 @@ class ClipPipeline:
             candidates = analysis.candidates
             self._emit(PipelineStage.ANALYZE, "Using cached clip analysis", progress=1)
         else:
-            self._emit(PipelineStage.ANALYZE, "Asking the model to select clips", progress=0)
+            self._emit(
+                PipelineStage.ANALYZE,
+                "Asking the model to select clips "
+                + f"({self.config.content_type.value} focus)",
+                progress=0,
+            )
             candidates = self._analyzer.find_clips(
                 transcript=transcript,
                 model=self.config.model,
                 clip_count=self.config.clip_count,
+                content_type=self.config.content_type,
                 min_duration=self.config.min_clip_duration,
                 max_duration=self.config.max_clip_duration,
                 cache_dir=video.work_dir / "analysis_chunks",
@@ -271,6 +278,7 @@ class ClipPipeline:
                 model=self.config.model,
                 analysis_backend=self._analysis_backend_id(),
                 clip_count=self.config.clip_count,
+                content_type=self.config.content_type,
                 min_clip_duration=self.config.min_clip_duration,
                 max_clip_duration=self.config.max_clip_duration,
                 analysis_prompt_version=ANALYSIS_PROMPT_VERSION,
@@ -285,6 +293,7 @@ class ClipPipeline:
 
         clip_paths = []
         thumbnail_paths = []
+        poster_paths = []
         if not self.config.analyze_only:
             clips_dir = video.work_dir / "clips"
             total = len(candidates)
@@ -307,6 +316,7 @@ class ClipPipeline:
                 )
                 clip_paths.append(rendered_path)
                 thumbnail_paths.append(rendered_path.with_suffix(".thumbnail.jpg"))
+                poster_paths.append(rendered_path.with_suffix(".poster.jpg"))
             self._renderer.cleanup_stale(clips_dir, clip_paths)
             self._emit(
                 PipelineStage.RENDER,
@@ -324,6 +334,7 @@ class ClipPipeline:
             candidates_path=candidates_path,
             clip_paths=clip_paths,
             thumbnail_paths=thumbnail_paths,
+            poster_paths=poster_paths,
         )
         self._emit(PipelineStage.COMPLETE, "Pipeline complete", progress=1)
         return result

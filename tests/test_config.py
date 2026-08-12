@@ -6,6 +6,7 @@ from collections.abc import Callable
 import pytest
 
 from yt_clipper import (
+    ContentType,
     DEFAULT_ANALYSIS_MODEL,
     LLMProvider,
     PipelineConfig,
@@ -22,6 +23,7 @@ def test_uses_nvidia_nim_model_by_default(
     monkeypatch.delenv("CLIPPER_LLM_MODEL", raising=False)
     monkeypatch.delenv("CLIPPER_NVIDIA_MODEL", raising=False)
     monkeypatch.delenv("CLIPPER_MODEL", raising=False)
+    monkeypatch.delenv("CLIPPER_CONTENT_TYPE", raising=False)
 
     assert DEFAULT_ANALYSIS_MODEL == (
         "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b"
@@ -31,6 +33,7 @@ def test_uses_nvidia_nim_model_by_default(
     assert config.video_layout == VideoLayout.FILL_CROP
     assert config.max_clip_duration == 60
     assert config.clip_count is None
+    assert config.content_type == ContentType.AUTO
     assert config.max_source_duration_seconds == 3600
     assert config.analysis_chunk_overlap_seconds == 60
     assert config.analysis_max_concurrency == 2
@@ -59,6 +62,21 @@ def test_accepts_more_than_five_clips_up_to_twenty() -> None:
 def test_omitted_clip_count_enables_automatic_selection() -> None:
     assert PipelineConfig().clip_count is None
     assert PipelineConfig(clip_count=None).clip_count is None
+
+
+def test_content_type_can_be_selected_from_environment_or_user_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPPER_CONTENT_TYPE", "comedy")
+
+    assert PipelineConfig().content_type == ContentType.COMEDY
+    assert PipelineConfig(content_type="stand-up").content_type == ContentType.COMEDY
+    assert PipelineConfig(content_type="educational").content_type == ContentType.EDUCATION
+
+
+def test_rejects_unknown_content_type() -> None:
+    with pytest.raises(ValueError, match="Unsupported content type"):
+        _ = PipelineConfig(content_type="ignore-the-editorial-rules")
 
 
 def test_rejects_source_duration_over_one_hour() -> None:

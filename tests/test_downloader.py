@@ -9,7 +9,7 @@ from yt_dlp.utils import RejectedVideoReached
 import yt_clipper.services.downloader as downloader_module
 from yt_clipper.domain.errors import DownloadError, DurationLimitError
 from yt_clipper.domain.models import VideoMetadata
-from yt_clipper.infrastructure.media_tools import MediaTools
+from yt_clipper.infrastructure.media_tools import MediaProbe, MediaTools
 from yt_clipper.services.downloader import (
     VideoDownloader,
     parse_cookies_from_browser,
@@ -44,6 +44,63 @@ def test_parses_browser_cookie_spec() -> None:
 def test_rejects_unsupported_cookie_browser() -> None:
     with pytest.raises(DownloadError, match="Unsupported cookie browser"):
         parse_cookies_from_browser("unknown-browser")
+
+
+def test_inspects_and_stages_local_mp4_without_ytdlp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "Funny local video.mp4"
+    source.write_bytes(b"local-video-content")
+    probe = MediaProbe(duration_seconds=120, has_video=True, has_audio=True)
+    monkeypatch.setattr(downloader_module, "probe_media", lambda *_args: probe)
+
+    class FailYoutubeDL:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pytest.fail("Local files must not call yt-dlp")
+
+    monkeypatch.setattr(downloader_module, "YoutubeDL", FailYoutubeDL)
+    downloader = VideoDownloader(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+
+    metadata = downloader.inspect(str(source))
+    staged = downloader.download(metadata, tmp_path / "output")
+
+    assert metadata.video_id.startswith("local-")
+    assert metadata.source_url == str(source.resolve())
+    assert metadata.title == "Funny local video"
+    assert staged.video_path.read_bytes() == source.read_bytes()
+    assert staged.video_path.name == "source.mp4"
+    assert staged.metadata_path.is_file()
+
+
+def test_rejects_local_remux_that_exceeds_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "Local.mkv"
+    source.write_bytes(b"tiny")
+    probe = MediaProbe(duration_seconds=60, has_video=True, has_audio=True)
+    monkeypatch.setattr(downloader_module, "probe_media", lambda *_args: probe)
+
+    def fake_run(command: list[str], **_kwargs: object) -> None:
+        Path(command[-1]).write_bytes(b"remux-too-large")
+
+    monkeypatch.setattr(downloader_module.subprocess, "run", fake_run)
+    downloader = VideoDownloader(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+    metadata = downloader.inspect(str(source))
+
+    with pytest.raises(DownloadError, match="Staged local video exceeds"):
+        downloader.download(
+            metadata,
+            tmp_path / "output",
+            maximum_download_bytes=8,
+        )
+
+    assert not (tmp_path / "output" / metadata.video_id / "source.mp4").exists()
 
 
 def test_download_filter_rejects_changed_over_limit_video_before_media_transfer(

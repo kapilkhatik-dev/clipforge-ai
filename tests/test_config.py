@@ -6,6 +6,7 @@ from collections.abc import Callable
 import pytest
 
 from yt_clipper import (
+    ContentType,
     DEFAULT_ANALYSIS_MODEL,
     LLMProvider,
     PipelineConfig,
@@ -15,6 +16,31 @@ from yt_clipper import (
 from yt_clipper.domain.models import TranscriptSegment, VideoMetadata
 
 
+@pytest.fixture(autouse=True)
+def isolate_llm_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep configuration tests independent from a developer's real .env."""
+    for variable_name in (
+        "CLIPPER_LLM_PROVIDER",
+        "CLIPPER_LLM_MODEL",
+        "CLIPPER_LLM_API_KEY",
+        "CLIPPER_CODEX_MODEL",
+        "CLIPPER_NVIDIA_MODEL",
+        "CLIPPER_OPENROUTER_MODEL",
+        "CLIPPER_OPENAI_MODEL",
+        "CLIPPER_ANTHROPIC_MODEL",
+        "CLIPPER_MODEL",
+        "CLIPPER_CONTENT_TYPE",
+        "CLIPPER_CODEX_BINARY",
+        "CLIPPER_CODEX_TIMEOUT_SECONDS",
+        "NVIDIA_NIM_API_KEY",
+        "NVIDIA_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(variable_name, raising=False)
+
+
 def test_uses_nvidia_nim_model_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -22,6 +48,7 @@ def test_uses_nvidia_nim_model_by_default(
     monkeypatch.delenv("CLIPPER_LLM_MODEL", raising=False)
     monkeypatch.delenv("CLIPPER_NVIDIA_MODEL", raising=False)
     monkeypatch.delenv("CLIPPER_MODEL", raising=False)
+    monkeypatch.delenv("CLIPPER_CONTENT_TYPE", raising=False)
 
     assert DEFAULT_ANALYSIS_MODEL == (
         "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b"
@@ -31,6 +58,7 @@ def test_uses_nvidia_nim_model_by_default(
     assert config.video_layout == VideoLayout.FILL_CROP
     assert config.max_clip_duration == 60
     assert config.clip_count is None
+    assert config.content_type == ContentType.AUTO
     assert config.max_source_duration_seconds == 3600
     assert config.analysis_chunk_overlap_seconds == 60
     assert config.analysis_max_concurrency == 2
@@ -59,6 +87,21 @@ def test_accepts_more_than_five_clips_up_to_twenty() -> None:
 def test_omitted_clip_count_enables_automatic_selection() -> None:
     assert PipelineConfig().clip_count is None
     assert PipelineConfig(clip_count=None).clip_count is None
+
+
+def test_content_type_can_be_selected_from_environment_or_user_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPPER_CONTENT_TYPE", "comedy")
+
+    assert PipelineConfig().content_type == ContentType.COMEDY
+    assert PipelineConfig(content_type="stand-up").content_type == ContentType.COMEDY
+    assert PipelineConfig(content_type="educational").content_type == ContentType.EDUCATION
+
+
+def test_rejects_unknown_content_type() -> None:
+    with pytest.raises(ValueError, match="Unsupported content type"):
+        _ = PipelineConfig(content_type="ignore-the-editorial-rules")
 
 
 def test_rejects_source_duration_over_one_hour() -> None:

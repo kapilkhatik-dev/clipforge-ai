@@ -1,4 +1,4 @@
-"""Debugger-friendly development runner for the YouTube clipper pipeline.
+"""Debugger-friendly development runner for the video clipper pipeline.
 
 Set CLIPPER_VIDEO_URL in .env, place breakpoints anywhere in ``yt_clipper``,
 and launch the "Debug YouTube Clipper" target in Zed. Future frontends should
@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from yt_clipper import (
     ClipPipeline,
+    ContentType,
     PipelineConfig,
     PipelineEvent,
     PipelineResult,
@@ -54,6 +55,7 @@ def run(
     config: PipelineConfig | None = None,
     video_layout: VideoLayout | None = None,
     clip_count: int | None = None,
+    content_type: ContentType | str | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> PipelineResult:
     """Run one video with values suitable for scripts, tests, or a debugger."""
@@ -61,10 +63,15 @@ def run(
     resolved_url = (video_url or os.getenv("CLIPPER_VIDEO_URL", "")).strip()
     if not resolved_url:
         raise ValueError(
-            "Set CLIPPER_VIDEO_URL in .env or pass video_url directly to main.run()."
+            "Set CLIPPER_VIDEO_URL to a URL or local path, or pass video_url "
+            "directly to main.run()."
         )
 
-    if config is not None and (video_layout is not None or clip_count is not None):
+    if config is not None and (
+        video_layout is not None
+        or clip_count is not None
+        or content_type is not None
+    ):
         raise ValueError("Pass either config or individual runner settings, not both.")
     if config is not None:
         pipeline_config = config
@@ -74,6 +81,8 @@ def run(
             config_values["video_layout"] = video_layout
         if clip_count is not None:
             config_values["clip_count"] = clip_count
+        if content_type is not None:
+            config_values["content_type"] = content_type
         pipeline_config = PipelineConfig.model_validate(config_values)
     callback = progress_callback if progress_callback is not None else ConsoleProgress()
     return ClipPipeline(
@@ -88,15 +97,17 @@ def print_result(result: PipelineResult) -> None:
     print(f"Candidates: {result.candidates_path}")
     if result.clip_paths:
         print("Clips:")
-        for candidate, clip_path, thumbnail_path in zip(
+        for candidate, clip_path, thumbnail_path, poster_path in zip(
             result.candidates,
             result.clip_paths,
             result.thumbnail_paths,
+            result.poster_paths,
             strict=True,
         ):
             print(f"  {candidate.title}")
             print(f"    Video: {clip_path}")
             print(f"    Thumbnail: {thumbnail_path}")
+            print(f"    Vertical poster: {poster_path}")
     else:
         print("No clips were rendered.")
 

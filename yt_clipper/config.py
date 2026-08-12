@@ -15,7 +15,23 @@ class LLMProvider(str, Enum):
     ANTHROPIC = "anthropic"
 
 
+class ContentType(str, Enum):
+    AUTO = "auto"
+    GENERAL = "general"
+    COMEDY = "comedy"
+    INTERVIEW = "interview"
+    PODCAST = "podcast"
+    EDUCATION = "education"
+    STORYTELLING = "storytelling"
+    NEWS = "news"
+    COMMENTARY = "commentary"
+    GAMING = "gaming"
+    SPORTS = "sports"
+    BUSINESS = "business"
+
+
 DEFAULT_LLM_PROVIDER: Final[LLMProvider] = LLMProvider.NVIDIA
+DEFAULT_CONTENT_TYPE: Final[ContentType] = ContentType.AUTO
 _DEFAULT_ANALYSIS_MODELS: Final[dict[LLMProvider, str]] = {
     LLMProvider.CODEX: "codex/default",
     LLMProvider.NVIDIA: "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b",
@@ -69,6 +85,35 @@ def resolve_llm_provider() -> LLMProvider:
     """Return the provider selected through the common application setting."""
     configured = os.getenv("CLIPPER_LLM_PROVIDER", DEFAULT_LLM_PROVIDER.value)
     return normalize_llm_provider(configured)
+
+
+def normalize_content_type(content_type: ContentType | str) -> ContentType:
+    """Normalize a safe, user-facing editorial genre."""
+    if isinstance(content_type, ContentType):
+        return content_type
+    normalized = content_type.strip().lower().replace("_", "-")
+    aliases = {
+        "stand-up": ContentType.COMEDY.value,
+        "standup": ContentType.COMEDY.value,
+        "stand-up-comedy": ContentType.COMEDY.value,
+        "educational": ContentType.EDUCATION.value,
+        "story": ContentType.STORYTELLING.value,
+        "current-affairs": ContentType.NEWS.value,
+    }
+    normalized = aliases.get(normalized, normalized)
+    try:
+        return ContentType(normalized)
+    except ValueError as exc:
+        supported = ", ".join(item.value for item in ContentType)
+        raise ValueError(
+            f"Unsupported content type '{content_type}'. Choose one of: {supported}."
+        ) from exc
+
+
+def resolve_content_type() -> ContentType:
+    """Return the optional editorial genre selected through the environment."""
+    configured = os.getenv("CLIPPER_CONTENT_TYPE", DEFAULT_CONTENT_TYPE.value)
+    return normalize_content_type(configured)
 
 
 def default_analysis_model(provider: LLMProvider | str) -> str:

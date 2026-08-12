@@ -78,7 +78,8 @@ These are all user-configurable environment variables read by the application
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `CLIPPER_VIDEO_URL` | For `main.py` when no URL argument is supplied | Input YouTube URL |
+| `CLIPPER_VIDEO_URL` | For `main.py` when no input argument is supplied | Input YouTube URL or supported local video path |
+| `CLIPPER_CONTENT_TYPE` | No; defaults to `auto` | Editorial genre used to rank clips; set `comedy` to prioritize complete jokes and punchlines |
 | `CLIPPER_LLM_PROVIDER` | No; defaults to `nvidia` | Active AI backend |
 | `CLIPPER_LLM_MODEL` | No | Common active-provider model override; highest environment precedence |
 | `CLIPPER_CODEX_MODEL` | No | Codex model, such as `codex/default` or `codex/gpt-5.6-sol` |
@@ -97,7 +98,7 @@ These are all user-configurable environment variables read by the application
 | `FFMPEG_BINARY`, `FFPROBE_BINARY` | No | Individual media-tool command or path overrides |
 | `CLIPPER_MODEL` | No | Deprecated model override retained for compatibility |
 
-Processing controls such as `clip_count`, durations, Whisper settings, output
+Other processing controls such as `clip_count`, durations, Whisper settings, output
 directory, and analysis concurrency are typed `PipelineConfig` fields rather than
 environment variables. Pass them from application/frontend code; the full list is
 in [One-hour and resource settings](#one-hour-and-resource-settings).
@@ -281,6 +282,35 @@ Final candidates must:
 
 The reviewer is allowed to return fewer clips than its candidate pool. This intentionally favors standalone quality over filling a quota. After review, approved clips are ranked first by distance from the configured maximum duration and then by editorial score. Automatic mode exports the complete ranked set; an explicit clip count truncates it to that upper bound. Model-call counts depend on the number of missing transcript chunks as described above, which matters for free-tier rate limits.
 
+## Content-aware clip selection
+
+Set `CLIPPER_CONTENT_TYPE=comedy` to explicitly tell both existing AI analysis
+stages that the input is comedy. The editor then prioritizes complete joke arcs,
+punchlines, timing, surprise, quotability, and tightly connected reactions. It
+rejects isolated laughter, setup without payoff, and callbacks that need missing
+context.
+
+`auto` remains the default. In auto mode, the model infers the dominant genre
+inside the existing candidate-selection and continuity-review requests. There is
+no separate classification API call, so Codex and OpenRouter retain their current
+request count and provider behavior.
+
+Supported values are `auto`, `general`, `comedy`, `interview`, `podcast`,
+`education`, `storytelling`, `news`, `commentary`, `gaming`, `sports`, and
+`business`. The same setting is available to application code:
+
+```python
+from yt_clipper import ContentType, PipelineConfig
+
+config = PipelineConfig(content_type=ContentType.COMEDY)
+```
+
+The development runner also accepts a direct override:
+
+```python
+result = run(video_url, content_type="comedy")
+```
+
 ## Clip count and duration settings
 
 Current defaults are:
@@ -328,6 +358,7 @@ All long-video controls are typed `PipelineConfig` fields, so a future frontend 
 | Setting | Default | Supported range / behavior |
 | --- | ---: | --- |
 | `clip_count` | `None` | Automatic: export every approved candidate up to 20; otherwise an integer from 1–20 is the output ceiling |
+| `content_type` | `ContentType.AUTO` | Genre-specific ranking; supports the values documented in [Content-aware clip selection](#content-aware-clip-selection) |
 | `max_source_duration_seconds` | `3600` | 60–3,600; lowers but cannot exceed the one-hour ceiling |
 | `max_source_download_bytes` | `4 * 1024**3` | 256 MiB–16 GiB; checked by yt-dlp, aggregate stream progress, and final source validation |
 | `whisper_device` | `WhisperDevice.AUTO` | `auto`, `cpu`, or `cuda` |
@@ -402,6 +433,7 @@ URL directly, also set the development input:
 
 ```dotenv
 CLIPPER_VIDEO_URL=https://www.youtube.com/watch?v=...
+CLIPPER_CONTENT_TYPE=comedy
 
 # codex | nvidia | openrouter | openai | anthropic
 CLIPPER_LLM_PROVIDER=codex
@@ -431,6 +463,26 @@ For direct debugging in Zed:
 4. Step through the pipeline normally; exceptions are intentionally not swallowed by the runner.
 
 `.zed/debug.json` also includes **Debug Active Python File**. Zed's Debugpy adapter should discover the project-local `.venv`; if it does not, select `.venv/Scripts/python.exe` as the workspace Python interpreter.
+
+### Local video files
+
+`main.run()` and `ClipPipeline.run()` also accept existing `.mp4`, `.m4v`, `.mkv`,
+`.mov`, and `.webm` files. Local MP4 files are hard-linked into the output workspace
+when possible, avoiding a second large copy. Other supported containers are remuxed
+to MP4 without re-encoding.
+
+Place an optional caption file beside the video using the same base name, such as
+`video.srt`, `video.vtt`, or `video.en-auto.srt`. Matching sidecar captions are used
+before Whisper; when no sidecar exists, automatic transcript mode falls back to
+local Whisper normally.
+
+```python
+result = run(
+    r"D:\Videos\comedy-special.mp4",
+    content_type="comedy",
+    clip_count=None,
+)
+```
 
 You can also call the runner directly from a debugger or Python code without environment-based URL input:
 
@@ -497,6 +549,14 @@ JPEG explicitly. The normalized original artwork is cached as
 thumbnail, rendering falls back to a representative frame from the middle of the
 clip so video creation can still complete.
 
+The renderer also creates `<clip-name>.poster.jpg`, a 1080x1920 (9:16) vertical
+version for Instagram Reels covers and Stories. It places the original thumbnail
+artwork flush against the top of a darkened, blurred full-frame background, then
+anchors the accent and balanced AI title together near the top of a generous lower
+safe area. Poster caching is independent from video
+rendering, so adding or refreshing the vertical artwork does not re-encode a valid
+MP4 or change its embedded horizontal preview.
+
 ## Frontend integration
 
 Use the package's public API rather than importing `main.py`:
@@ -555,7 +615,7 @@ output/
     └── temp/
 ```
 
-Each MP4 in `clips/` has a matching `.thumbnail.jpg` and `.render.json` file. `output/.whisper.lock` is created only when local Whisper is used, and the number of chunk-analysis files depends on transcript size, up to the 64-chunk safety limit. Source media, the original thumbnail, transcripts, analysis, rendered clips, and titled thumbnails are fingerprinted or probed before reuse. The inexpensive source fingerprint includes file size, modification time, and the first and last MiB; Whisper cache fingerprints also include its processing options, while final analysis cache validation includes the prompt and chunk configuration. The video layout and thumbnail design are part of the render fingerprint, so changing either safely rerenders clips without repeating transcription or AI analysis. JSON, JPEG, and final MP4 artifacts are written transactionally, stale managed clips and thumbnails are removed after a successful render, and `PipelineConfig(force=True)` recreates the complete pipeline.
+Each MP4 in `clips/` has matching `.thumbnail.jpg`, `.poster.jpg`, and `.render.json` files. `output/.whisper.lock` is created only when local Whisper is used, and the number of chunk-analysis files depends on transcript size, up to the 64-chunk safety limit. Source media, the original thumbnail, transcripts, analysis, rendered clips, and titled artwork are fingerprinted or probed before reuse. The inexpensive source fingerprint includes file size, modification time, and the first and last MiB; Whisper cache fingerprints also include its processing options, while final analysis cache validation includes the prompt and chunk configuration. Video layout and horizontal thumbnail design are part of the render fingerprint, while vertical posters have an independent fingerprint. JSON, JPEG, and final MP4 artifacts are written transactionally, stale managed clips and artwork are removed after a successful render, and `PipelineConfig(force=True)` recreates the complete pipeline.
 
 ## Validation
 

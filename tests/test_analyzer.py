@@ -11,7 +11,7 @@ from typing import TypedDict
 import pytest
 
 import yt_clipper.services.analyzer as analyzer_module
-from yt_clipper import DEFAULT_ANALYSIS_MODEL, LLMProvider
+from yt_clipper import ContentType, DEFAULT_ANALYSIS_MODEL, LLMProvider
 from yt_clipper.domain.errors import AnalysisError
 from yt_clipper.domain.models import (
     ClipCandidate,
@@ -502,6 +502,75 @@ def test_analyzer_retries_invalid_json_once() -> None:
     assert result[0].title == "Good"
     assert result[0].standalone is True
     assert result[0].opening_context
+
+
+def test_comedy_content_type_guides_both_existing_analysis_stages() -> None:
+    generation = (
+        '{"clips": [{"title": "Good", "start": 10, "end": 35, '
+        '"score": 0.9, "hook": "Hook", "reason": "Reason"}]}'
+    )
+    responses = iter(
+        [
+            {"choices": [{"message": {"content": generation}}]},
+            {"choices": [{"message": {"content": _reviewed_candidate_json()}}]},
+        ]
+    )
+    calls = []
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    result = TranscriptAnalyzer(completion_fn=fake_completion).find_clips(
+        _test_transcript(),
+        model="test/model",
+        clip_count=1,
+        min_duration=20,
+        max_duration=40,
+        content_type=ContentType.COMEDY,
+    )
+
+    assert result[0].title == "Good"
+    assert len(calls) == 2
+    for call in calls:
+        system_message = call["messages"][0]["content"]
+        prompt = call["messages"][1]["content"]
+        assert "configured content type is 'comedy'" in system_message
+        assert "explicitly categorized as comedy" in prompt
+        assert "setup, escalation, punchline" in prompt
+        assert "isolated laughter or reactions" in prompt
+
+
+def test_auto_content_type_infers_genre_without_a_classification_call() -> None:
+    generation = (
+        '{"clips": [{"title": "Good", "start": 10, "end": 35, '
+        '"score": 0.9, "hook": "Hook", "reason": "Reason"}]}'
+    )
+    responses = iter(
+        [
+            {"choices": [{"message": {"content": generation}}]},
+            {"choices": [{"message": {"content": _reviewed_candidate_json()}}]},
+        ]
+    )
+    calls = []
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    _ = TranscriptAnalyzer(completion_fn=fake_completion).find_clips(
+        _test_transcript(),
+        model="test/model",
+        clip_count=1,
+        min_duration=20,
+        max_duration=40,
+    )
+
+    assert len(calls) == 2
+    assert all(
+        "Infer the dominant content type" in call["messages"][1]["content"]
+        for call in calls
+    )
 
 
 def test_codex_provider_uses_structured_cli_results_without_litellm() -> None:

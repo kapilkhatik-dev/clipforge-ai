@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 import yt_clipper.application.pipeline as pipeline_module
-from yt_clipper import ClipPipeline, PipelineConfig, WhisperDevice
+from yt_clipper import ClipPipeline, ContentType, PipelineConfig, WhisperDevice
 from yt_clipper.domain.models import (
     ClipCandidate,
     DownloadedVideo,
@@ -137,6 +137,7 @@ def test_pipeline_propagates_one_hour_resource_controls(
         analysis_chunk_overlap_seconds=75,
         analysis_max_concurrency=3,
         analysis_request_max_attempts=4,
+        content_type=ContentType.COMEDY,
     )
     pipeline = ClipPipeline(
         config,
@@ -171,6 +172,10 @@ def test_pipeline_propagates_one_hour_resource_controls(
     assert analysis_settings["max_concurrency"] == 3
     assert analysis_settings["request_max_attempts"] == 4
     assert analysis_settings["clip_count"] is None
+    assert analysis_settings["content_type"] == ContentType.COMEDY
+
+    saved_analysis = result.candidates_path.read_text(encoding="utf-8")
+    assert '"content_type": "comedy"' in saved_analysis
 
     assert result.video.metadata.duration_seconds == 3599
     assert result.candidates[0].duration == 60
@@ -324,5 +329,9 @@ def test_pipeline_renders_every_candidate_in_automatic_mode(
     assert len(result.clip_paths) == 3
     assert result.thumbnail_paths == [
         tmp_path / metadata.video_id / "clips" / f"{index:02d}.thumbnail.jpg"
+        for index in range(1, 4)
+    ]
+    assert result.poster_paths == [
+        tmp_path / metadata.video_id / "clips" / f"{index:02d}.poster.jpg"
         for index in range(1, 4)
     ]

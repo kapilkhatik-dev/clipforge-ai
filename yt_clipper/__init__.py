@@ -1,7 +1,12 @@
 """Public, framework-neutral API for the YouTube clipper pipeline."""
 
 from .application.pipeline import ClipPipeline
-from .config import DEFAULT_ANALYSIS_MODEL, LLMProvider, resolve_analysis_model
+from .config import (
+    DEFAULT_ANALYSIS_MODEL,
+    ContentType,
+    LLMProvider,
+    resolve_analysis_model,
+)
 from .domain.errors import (
     AnalysisError,
     ClipperError,
@@ -34,6 +39,7 @@ __all__ = [
     "ClipCandidate",
     "ClipPipeline",
     "ClipperError",
+    "ContentType",
     "DependencyError",
     "DownloadError",
     "DurationLimitError",

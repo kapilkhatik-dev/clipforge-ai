@@ -17,6 +17,7 @@ cookies*.txt
 
 # Generated media and temporary downloads
 output/
+downloads/
 temp/
 *.part
 *.ytdl

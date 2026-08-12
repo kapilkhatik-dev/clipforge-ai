@@ -33,12 +33,13 @@ from ..infrastructure.artifacts import (
     fingerprint_payload,
 )
 from ..infrastructure.media_tools import MediaTools, extract_mono_pcm
-from .downloader import parse_cookies_from_browser
+from .downloader import parse_cookies_from_browser, resolve_local_video_path
 
 LOGGER = logging.getLogger(__name__)
 _WHISPER_PIPELINE_VERSION = 2
 _AUDIO_SAMPLE_RATE = 16_000
 _MAX_CAPTION_RESPONSE_BYTES = 32 * 1024 * 1024
+_LOCAL_CAPTION_EXTENSIONS = (".srt", ".vtt")
 TranscriptProgressCallback = Callable[[float], None]
 _TIMESTAMP_LINE = re.compile(
     r"(?P<start>(?:\d{1,2}:)?\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
@@ -270,6 +271,39 @@ def _whisper_options_fingerprint(
     )
 
 
+def _local_caption_candidates(source_path: Path, language: str) -> list[Path]:
+    """Return matching sidecars in deterministic language-preference order."""
+    source_stem = source_path.stem.casefold()
+    candidates = [
+        path
+        for path in sorted(
+            source_path.parent.iterdir(),
+            key=lambda item: item.name.casefold(),
+        )
+        if path.is_file()
+        and path.suffix.casefold() in _LOCAL_CAPTION_EXTENSIONS
+        and (
+            path.stem.casefold() == source_stem
+            or path.name.casefold().startswith(f"{source_stem}.")
+        )
+    ]
+
+    requested = language.casefold()
+    if requested != "auto":
+        requested_base = requested.split("-")[0]
+        candidates.sort(
+            key=lambda path: (
+                0
+                if f".{requested}." in path.name.casefold()
+                else 1
+                if f".{requested_base}-" in path.name.casefold()
+                else 2,
+                path.name.casefold(),
+            )
+        )
+    return candidates
+
+
 class TranscriptService:
     def __init__(self, media_tools: MediaTools) -> None:
         self._media_tools = media_tools
@@ -291,10 +325,28 @@ class TranscriptService:
         progress_callback: TranscriptProgressCallback | None = None,
     ) -> tuple[TranscriptDocument, Path]:
         cache_path = video.work_dir / "transcript.json"
+        local_source = resolve_local_video_path(video.metadata.source_url)
         try:
-            source_fingerprint = fingerprint_file(video.video_path)
+            video_fingerprint = fingerprint_file(video.video_path)
+            if local_source is None or mode == TranscriptMode.WHISPER:
+                source_fingerprint = video_fingerprint
+            else:
+                source_fingerprint = fingerprint_payload(
+                    {
+                        "video": video_fingerprint,
+                        "caption_sidecars": [
+                            {
+                                "name": path.name,
+                                "fingerprint": fingerprint_file(path),
+                            }
+                            for path in _local_caption_candidates(local_source, language)
+                        ],
+                    }
+                )
         except OSError as exc:
-            raise TranscriptError(f"Could not fingerprint source video: {exc}") from exc
+            raise TranscriptError(
+                f"Could not fingerprint local transcript inputs: {exc}"
+            ) from exc
         whisper_fingerprint = _whisper_options_fingerprint(
             whisper_model,
             whisper_device,
@@ -324,14 +376,26 @@ class TranscriptService:
         transcript: TranscriptDocument | None = None
         if mode in {TranscriptMode.AUTO, TranscriptMode.CAPTIONS}:
             try:
-                transcript = self._from_youtube_captions(
-                    video, language, source_fingerprint, cookies_from_browser
+                transcript = (
+                    self._from_local_sidecar(
+                        video,
+                        local_source,
+                        language,
+                        source_fingerprint,
+                    )
+                    if local_source is not None
+                    else self._from_youtube_captions(
+                        video,
+                        language,
+                        source_fingerprint,
+                        cookies_from_browser,
+                    )
                 )
             except TranscriptError:
                 if mode == TranscriptMode.CAPTIONS:
                     raise
                 LOGGER.warning(
-                    "YouTube captions were unavailable; falling back to local Whisper.",
+                    "Captions were unavailable; falling back to local Whisper.",
                     exc_info=True,
                 )
 
@@ -357,6 +421,51 @@ class TranscriptService:
 
         atomic_write_text(cache_path, transcript.model_dump_json(indent=2))
         return transcript, cache_path
+
+    def _from_local_sidecar(
+        self,
+        video: DownloadedVideo,
+        source_path: Path,
+        language: str,
+        source_fingerprint: str,
+    ) -> TranscriptDocument | None:
+        for caption_path in _local_caption_candidates(source_path, language):
+            try:
+                if caption_path.stat().st_size > _MAX_CAPTION_RESPONSE_BYTES:
+                    continue
+                payload = caption_path.read_bytes()
+                segments = normalize_segments(
+                    parse_vtt_or_srt_captions(payload),
+                    video.metadata.duration_seconds,
+                )
+            except OSError as exc:
+                LOGGER.debug("Could not read local captions %s: %s", caption_path, exc)
+                continue
+            if not segments:
+                continue
+
+            name_without_extension = caption_path.name[: -len(caption_path.suffix)]
+            language_suffix = name_without_extension.removeprefix(
+                f"{source_path.stem}."
+            )
+            detected_language = (
+                language_suffix if language_suffix != name_without_extension else language
+            )
+            origin = (
+                TranscriptOrigin.AUTOMATIC
+                if "auto" in language_suffix.casefold()
+                else TranscriptOrigin.MANUAL
+            )
+            return TranscriptDocument(
+                video_id=video.metadata.video_id,
+                language=detected_language or language,
+                requested_language=language,
+                origin=origin,
+                source_fingerprint=source_fingerprint,
+                duration_seconds=video.metadata.duration_seconds,
+                segments=segments,
+            )
+        return None
 
     @staticmethod
     def _cache_matches(

@@ -1,11 +1,13 @@
-"""yt-dlp integration for bounded metadata inspection and video downloads."""
+"""Bounded local-file staging and yt-dlp video downloads."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -29,6 +31,7 @@ from ..infrastructure.media_tools import MediaTools, probe_media
 
 DownloadProgressHook = Callable[[dict[str, Any]], None]
 _YOUTUBE_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_LOCAL_VIDEO_EXTENSIONS = frozenset({".m4v", ".mkv", ".mov", ".mp4", ".webm"})
 _MAX_THUMBNAIL_DOWNLOAD_BYTES = 10 * 1024**2
 LOGGER = logging.getLogger(__name__)
 
@@ -60,6 +63,26 @@ def validate_youtube_video_id(video_id: str) -> str:
     if not _YOUTUBE_VIDEO_ID.fullmatch(video_id):
         raise DownloadError("YouTube returned an invalid video identifier.")
     return video_id
+
+
+def resolve_local_video_path(value: str) -> Path | None:
+    """Resolve an existing supported local video path without treating URLs as files."""
+    if urlparse(value).scheme.casefold() in {"http", "https"}:
+        return None
+    candidate = Path(value).expanduser()
+    try:
+        if candidate.is_file() and candidate.suffix.casefold() in _LOCAL_VIDEO_EXTENSIONS:
+            return candidate.resolve()
+    except OSError:
+        return None
+    return None
+
+
+def local_video_id(path: Path) -> str:
+    """Create a safe cache key that changes when the local source changes."""
+    stat = path.stat()
+    identity = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    return f"local-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]}"
 
 
 def parse_cookies_from_browser(value: str | None) -> tuple[str, str | None, str | None, str | None] | None:
@@ -222,6 +245,26 @@ class VideoDownloader:
         cookies_from_browser: str | None = None,
         maximum_duration_seconds: int = MAX_SOURCE_DURATION_SECONDS,
     ) -> VideoMetadata:
+        if local_path := resolve_local_video_path(url):
+            try:
+                probe = probe_media(self._media_tools, local_path)
+            except MediaProbeError as exc:
+                raise DownloadError(f"Could not inspect local video: {exc}") from exc
+            if not probe.has_video or not probe.has_audio:
+                raise DownloadError(
+                    "Local input must contain both video and audio streams."
+                )
+            duration = validate_source_duration(
+                probe.duration_seconds,
+                maximum_seconds=maximum_duration_seconds,
+            )
+            return VideoMetadata(
+                video_id=local_video_id(local_path),
+                source_url=str(local_path),
+                title=local_path.stem,
+                duration_seconds=duration,
+            )
+
         options = self._common_options(cookies_from_browser)
         options["skip_download"] = True
 
@@ -271,7 +314,12 @@ class VideoDownloader:
             metadata.duration_seconds,
             maximum_seconds=maximum_duration_seconds,
         )
-        video_id = validate_youtube_video_id(metadata.video_id)
+        local_path = resolve_local_video_path(metadata.source_url)
+        video_id = (
+            metadata.video_id
+            if local_path is not None
+            else validate_youtube_video_id(metadata.video_id)
+        )
         output_root = output_root.expanduser().resolve()
         work_dir = (output_root / video_id).resolve()
         if work_dir.parent != output_root:
@@ -314,6 +362,110 @@ class VideoDownloader:
             for existing in work_dir.glob("source.*"):
                 if existing.is_file():
                     existing.unlink()
+
+        if local_path is not None:
+            try:
+                source_size = local_path.stat().st_size
+            except OSError as exc:
+                raise DownloadError(f"Could not inspect local video size: {exc}") from exc
+            if source_size > maximum_download_bytes:
+                raise DownloadError(
+                    "Local video exceeds the configured source-size limit."
+                )
+
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    prefix=".source-local-",
+                    suffix=".mp4",
+                    dir=work_dir,
+                    delete=False,
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                temporary_path.unlink(missing_ok=True)
+
+                if local_path.suffix.casefold() == ".mp4":
+                    try:
+                        os.link(local_path, temporary_path)
+                    except OSError:
+                        shutil.copy2(local_path, temporary_path)
+                else:
+                    subprocess.run(
+                        [
+                            str(self._media_tools.ffmpeg),
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-nostdin",
+                            "-y",
+                            "-i",
+                            str(local_path),
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "0:a:0",
+                            "-c",
+                            "copy",
+                            "-movflags",
+                            "+faststart",
+                            str(temporary_path),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        timeout=600,
+                    )
+                os.replace(temporary_path, video_path)
+                temporary_path = None
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                raise DownloadError(f"Could not stage local video: {exc}") from exc
+            finally:
+                if temporary_path:
+                    temporary_path.unlink(missing_ok=True)
+
+            try:
+                if video_path.stat().st_size > maximum_download_bytes:
+                    video_path.unlink(missing_ok=True)
+                    raise DownloadError(
+                        "Staged local video exceeds the configured source-size limit."
+                    )
+                staged_probe = probe_media(self._media_tools, video_path)
+            except OSError as exc:
+                video_path.unlink(missing_ok=True)
+                raise DownloadError(
+                    f"Could not inspect staged local video size: {exc}"
+                ) from exc
+            except MediaProbeError as exc:
+                video_path.unlink(missing_ok=True)
+                raise DownloadError(f"Local media failed validation: {exc}") from exc
+            if (
+                not staged_probe.has_video
+                or not staged_probe.has_audio
+                or staged_probe.duration_seconds > maximum_duration_seconds + 5
+                or abs(staged_probe.duration_seconds - metadata.duration_seconds) > 5
+            ):
+                video_path.unlink(missing_ok=True)
+                raise DownloadError("Staged local media does not match its metadata.")
+
+            if progress_hook:
+                progress_hook(
+                    {
+                        "status": "downloading",
+                        "downloaded_bytes": source_size,
+                        "total_bytes": source_size,
+                    }
+                )
+            atomic_write_text(metadata_path, metadata.model_dump_json(indent=2))
+            return DownloadedVideo(
+                metadata=metadata,
+                video_path=video_path,
+                metadata_path=metadata_path,
+                work_dir=work_dir,
+                thumbnail_path=thumbnail_path,
+            )
 
         duration_rejection: list[DownloadError] = []
         size_rejection: list[DownloadError] = []

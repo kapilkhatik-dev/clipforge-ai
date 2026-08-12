@@ -6,6 +6,8 @@ from yt_clipper.services.renderer import (
     build_caption_cues,
     build_thumbnail_ass_document,
     build_thumbnail_filter_graph,
+    build_vertical_poster_ass_document,
+    build_vertical_poster_filter_graph,
     build_video_filter_graph,
     clip_transcript_segments,
     slugify,
@@ -127,6 +129,31 @@ def test_thumbnail_filter_uses_hd_artwork_with_readability_panel() -> None:
     assert "black@0.72" in graph
     assert "0xFFDF17@1" in graph
     assert "subtitles=filename='thumbnail-title.ass'" in graph
+
+
+def test_vertical_poster_title_is_balanced_for_nine_by_sixteen() -> None:
+    document = build_vertical_poster_ass_document(
+        "The Paranormal Experiences Were Ghosting"
+    )
+
+    assert "PlayResX: 1080" in document
+    assert "PlayResY: 1920" in document
+    assert document.count(r"\N") == 2
+    assert "Style: PosterTitle,Arial," in document
+    assert ",1,4,2.5,7,84,84,1037,1" in document
+
+
+def test_vertical_poster_uses_blurred_artwork_and_safe_title_panel() -> None:
+    graph = build_vertical_poster_filter_graph()
+
+    assert "scale=1080:1920" in graph
+    assert "gblur=sigma=42" in graph
+    assert "overlay=(W-w)/2:0" in graph
+    assert "drawbox=x=0:y=806" in graph
+    assert "drawbox=x=84:y=898" in graph
+    assert "black@0.76" in graph
+    assert "0xFFDF17@1" in graph
+    assert "subtitles=filename='poster-title.ass'[poster]" in graph
 
 
 def test_slugify_produces_safe_deterministic_name() -> None:

@@ -482,52 +482,6 @@ def build_video_filter_graph(
     )
 
 
-def build_montage_filter_graph(
-    moments: list[HighlightMoment],
-    video_layout: VideoLayout,
-    width: int,
-    height: int,
-) -> str:
-    """Build exact per-moment trims followed by one captioned A/V concat."""
-    filters: list[str] = []
-    concat_inputs: list[str] = []
-    for index, moment in enumerate(moments):
-        trim = f"trim=start={moment.start:.3f}:end={moment.end:.3f},setpts=PTS-STARTPTS"
-        if video_layout == VideoLayout.FILL_CROP:
-            filters.append(
-                f"[0:v:0]{trim},scale={width}:{height}:"
-                "force_original_aspect_ratio=increase:flags=lanczos,"
-                f"crop={width}:{height},setsar=1[v{index}]"
-            )
-        else:
-            filters.extend(
-                [
-                    f"[0:v:0]{trim},split=2[background{index}][foreground{index}]",
-                    f"[background{index}]scale={width}:{height}:"
-                    "force_original_aspect_ratio=increase:flags=lanczos,"
-                    f"crop={width}:{height},gblur=sigma=24,"
-                    f"eq=brightness=-0.22,setsar=1[bg{index}]",
-                    f"[foreground{index}]scale={width}:{height}:"
-                    "force_original_aspect_ratio=decrease:flags=lanczos,"
-                    f"setsar=1[fg{index}]",
-                    f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2[v{index}]",
-                ]
-            )
-        filters.append(
-            f"[0:a:0]atrim=start={moment.start:.3f}:end={moment.end:.3f},"
-            f"asetpts=PTS-STARTPTS[a{index}]"
-        )
-        concat_inputs.append(f"[v{index}][a{index}]")
-    filters.append(
-        "".join(concat_inputs)
-        + f"concat=n={len(moments)}:v=1:a=1[montage_video][audio]"
-    )
-    filters.append(
-        "[montage_video]subtitles=filename='captions.ass'[video]"
-    )
-    return ";".join(filters)
-
-
 class ClipRenderer:
     def __init__(self, media_tools: MediaTools) -> None:
         self._media_tools = media_tools
@@ -1021,7 +975,7 @@ class ClipRenderer:
                     "width": width,
                     "height": height,
                     "caption_style": "bold-yellow-charcoal-outline-v2",
-                    "montage_style": "exact-windows-hard-cut-v1",
+                    "montage_style": "bounded-segment-encode-concat-v2",
                 }
             )
         except OSError as exc:
@@ -1045,23 +999,16 @@ class ClipRenderer:
 
         for path in (output_path, thumbnail_path, manifest_path):
             path.unlink(missing_ok=True)
-        relative_segments = montage_transcript_segments(
-            transcript.segments,
-            montage.moments,
-        )
         temp_root = video.work_dir / "temp"
         temp_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="montage-", dir=temp_root) as temp:
             temp_dir = Path(temp)
             caption_path = temp_dir / "captions.ass"
+            concat_path = temp_dir / "segments.txt"
             thumbnail_title_path = temp_dir / "thumbnail-title.ass"
             temporary_thumbnail = temp_dir / "thumbnail.jpg"
             encoded_output = temp_dir / "encoded.mp4"
             temporary_output = temp_dir / "render.mp4"
-            caption_path.write_text(
-                build_ass_document(relative_segments, width=width, height=height),
-                encoding="utf-8-sig",
-            )
             thumbnail_title_path.write_text(
                 build_thumbnail_ass_document(montage.title),
                 encoding="utf-8-sig",
@@ -1118,56 +1065,125 @@ class ClipRenderer:
                     + ("\n".join(stderr.strip().splitlines()[-12:]) or str(exc))
                 ) from exc
 
-            command = [
+            segment_paths: list[Path] = []
+            for index, moment in enumerate(montage.moments):
+                caption_path.write_text(
+                    build_ass_document(
+                        clip_transcript_segments(
+                            transcript.segments,
+                            moment.start,
+                            moment.end,
+                        ),
+                        width=width,
+                        height=height,
+                    ),
+                    encoding="utf-8-sig",
+                )
+                segment_path = temp_dir / f"segment-{index:02d}.mp4"
+                segment_paths.append(segment_path)
+                segment_command = [
+                    str(self._media_tools.ffmpeg),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-ss",
+                    f"{moment.start:.3f}",
+                    "-t",
+                    f"{moment.duration:.3f}",
+                    "-i",
+                    str(video.video_path.resolve()),
+                    "-filter_complex",
+                    build_video_filter_graph(video_layout, width, height),
+                    "-map",
+                    "[video]",
+                    "-map",
+                    "0:a:0",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "medium",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    "-shortest",
+                    str(segment_path),
+                ]
+                try:
+                    subprocess.run(
+                        segment_command,
+                        cwd=temp_dir,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                except (OSError, subprocess.CalledProcessError) as exc:
+                    stderr = getattr(exc, "stderr", "") or ""
+                    raise RenderError(
+                        f"FFmpeg failed while rendering highlight moment {index + 1}: "
+                        + ("\n".join(stderr.strip().splitlines()[-12:]) or str(exc))
+                    ) from exc
+                if not segment_path.is_file():
+                    raise RenderError(
+                        f"FFmpeg did not create highlight moment {index + 1}."
+                    )
+
+            concat_path.write_text(
+                "".join(f"file '{path.name}'\n" for path in segment_paths),
+                encoding="utf-8",
+            )
+            concat_command = [
                 str(self._media_tools.ffmpeg),
                 "-hide_banner",
                 "-loglevel",
                 "error",
                 "-nostdin",
                 "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
                 "-i",
-                str(video.video_path.resolve()),
-                "-filter_complex",
-                build_montage_filter_graph(
-                    montage.moments,
-                    video_layout,
-                    width,
-                    height,
-                ),
+                str(concat_path),
                 "-map",
-                "[video]",
+                "0:v:0",
                 "-map",
-                "[audio]",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
+                "0:a:0",
+                "-c",
+                "copy",
                 "-movflags",
                 "+faststart",
                 str(encoded_output),
             ]
             try:
                 subprocess.run(
-                    command,
+                    concat_command,
                     cwd=temp_dir,
                     check=True,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    timeout=90,
                 )
-            except (OSError, subprocess.CalledProcessError) as exc:
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
                 stderr = getattr(exc, "stderr", "") or ""
                 raise RenderError(
-                    "FFmpeg failed while rendering the highlight montage: "
+                    "FFmpeg failed while joining the highlight moments: "
                     + ("\n".join(stderr.strip().splitlines()[-12:]) or str(exc))
                 ) from exc
 

@@ -21,7 +21,7 @@ from ..config import (
     normalize_content_type,
     normalize_llm_provider,
 )
-from ..domain.errors import AnalysisError
+from ..domain.errors import AnalysisError, InsufficientHighlightsError
 from ..domain.models import (
     ANALYSIS_PROMPT_VERSION,
     MAX_CLIP_COUNT,
@@ -43,6 +43,8 @@ AnalysisChunkProgressCallback = Callable[[int, int], None]
 LOGGER = logging.getLogger(__name__)
 _CHUNK_ANALYSIS_SCHEMA_VERSION = 1
 _CLIP_TOOL_NAME = "submit_clip_candidates"
+_HIGHLIGHT_MOMENTS_TOOL_NAME = "submit_highlight_moments"
+_HIGHLIGHT_MONTAGE_TOOL_NAME = "submit_highlight_montage"
 _MAX_ANALYSIS_OUTPUT_TOKENS = 10_000
 _NEMOTRON_REASONING_TOKENS = 2_000
 _REVIEW_CONTEXT_PADDING_SECONDS = 15.0
@@ -450,6 +452,26 @@ def validate_highlight_moments(
     return sorted(retained.values(), key=lambda item: (-item.score, item.start))
 
 
+def validate_highlight_screening_payload(
+    payload: dict[str, Any] | list[Any],
+    *,
+    allowed_windows: Sequence[dict[str, Any]],
+) -> list[HighlightMoment]:
+    """Validate the screening envelope while permitting an explicit empty result."""
+    if not isinstance(payload, dict):
+        raise AnalysisError("The highlight screening response must be a JSON object.")
+    if set(payload) != {"moments"}:
+        raise AnalysisError(
+            "The highlight screening response must contain only a 'moments' array."
+        )
+    items = payload["moments"]
+    if not isinstance(items, list):
+        raise AnalysisError("The highlight screening 'moments' value must be an array.")
+    if not items:
+        return []
+    return validate_highlight_moments(items, allowed_windows=allowed_windows)
+
+
 def validate_highlight_montage(
     payload: dict[str, Any] | list[Any],
     *,
@@ -485,8 +507,66 @@ def validate_highlight_montage(
         seen.add(key)
         total += source.duration
     if len(selected) < 2:
-        raise AnalysisError("The montage must contain at least two approved moments.")
+        raise InsufficientHighlightsError(
+            "The montage must contain at least two approved moments."
+        )
     return montage.model_copy(update={"moments": selected})
+
+
+def select_diverse_highlight_pool(
+    batch_moments: Sequence[Sequence[HighlightMoment]],
+    *,
+    limit: int,
+) -> list[HighlightMoment]:
+    """Keep high-quality candidates while representing the complete timeline."""
+    if limit <= 0:
+        return []
+
+    groups: list[list[HighlightMoment]] = []
+    all_candidates: dict[tuple[float, float], HighlightMoment] = {}
+    for moments in batch_moments:
+        group: dict[tuple[float, float], HighlightMoment] = {}
+        for moment in moments:
+            key = (round(moment.start, 3), round(moment.end, 3))
+            existing = group.get(key)
+            if existing is None or moment.score > existing.score:
+                group[key] = moment
+            existing = all_candidates.get(key)
+            if existing is None or moment.score > existing.score:
+                all_candidates[key] = moment
+        if group:
+            groups.append(
+                sorted(group.values(), key=lambda item: (-item.score, item.start))
+            )
+
+    if not groups:
+        return []
+
+    selected: dict[tuple[float, float], HighlightMoment] = {}
+    if len(groups) <= limit:
+        coverage_groups = [[group[0]] for group in groups]
+    else:
+        coverage_groups = []
+        for slot in range(limit):
+            first = slot * len(groups) // limit
+            last = (slot + 1) * len(groups) // limit
+            coverage_groups.append(
+                [moment for group in groups[first:last] for moment in group]
+            )
+
+    for candidates in coverage_groups:
+        best = min(candidates, key=lambda item: (-item.score, item.start))
+        selected[(round(best.start, 3), round(best.end, 3))] = best
+
+    for moment in sorted(
+        all_candidates.values(),
+        key=lambda item: (-item.score, item.start),
+    ):
+        if len(selected) >= limit:
+            break
+        selected.setdefault((round(moment.start, 3), round(moment.end, 3)), moment)
+
+    return sorted(selected.values(), key=lambda item: (-item.score, item.start))
 
 
 def validate_clip_candidates(
@@ -784,7 +864,10 @@ def _response_content(response: Any) -> str:
     raise AnalysisError("LiteLLM returned an empty text response.")
 
 
-def _response_tool_payload(response: Any) -> dict[str, Any] | list[Any] | None:
+def _response_tool_payload(
+    response: Any,
+    tool_name: str = _CLIP_TOOL_NAME,
+) -> dict[str, Any] | list[Any] | None:
     message = _response_message(response)
     tool_calls = (
         message.get("tool_calls") if isinstance(message, dict) else message.tool_calls
@@ -801,7 +884,7 @@ def _response_tool_payload(response: Any) -> dict[str, Any] | list[Any] | None:
         if not function:
             continue
         name = function.get("name") if isinstance(function, dict) else function.name
-        if name != _CLIP_TOOL_NAME:
+        if name != tool_name:
             continue
         arguments = (
             function.get("arguments")
@@ -842,11 +925,27 @@ def _clip_selection_tool(
     }
 
 
-def _model_request_options(
+def _structured_output_tool(
+    tool_name: str,
+    output_schema: dict[str, Any],
+    description: str,
+) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": description,
+            "parameters": output_schema,
+        },
+    }
+
+
+def _structured_model_request_options(
     model: str,
-    requested_count: int,
-    item_schema: dict[str, Any],
-    tool_description: str,
+    *,
+    tool_name: str,
+    output_schema: dict[str, Any],
+    description: str,
 ) -> dict[str, Any]:
     if model not in _STRUCTURED_TOOL_MODELS:
         return {}
@@ -854,7 +953,7 @@ def _model_request_options(
     extra_body: dict[str, Any] | None = None
     tool_choice: dict[str, Any] = {
         "type": "function",
-        "function": {"name": _CLIP_TOOL_NAME},
+        "function": {"name": tool_name},
     }
     if model == _NVIDIA_NIM_NEMOTRON_ULTRA_MODEL:
         extra_body = {
@@ -872,21 +971,34 @@ def _model_request_options(
             }
         }
     elif model == _ANTHROPIC_DEFAULT_MODEL:
-        tool_choice = {"type": "tool", "name": _CLIP_TOOL_NAME}
+        tool_choice = {"type": "tool", "name": tool_name}
 
     request_options: dict[str, Any] = {
-        "tools": [
-            _clip_selection_tool(
-                requested_count,
-                item_schema,
-                tool_description,
-            )
-        ],
+        "tools": [_structured_output_tool(tool_name, output_schema, description)],
         "tool_choice": tool_choice,
     }
     if extra_body is not None:
         request_options["extra_body"] = extra_body
     return request_options
+
+
+def _model_request_options(
+    model: str,
+    requested_count: int,
+    item_schema: dict[str, Any],
+    tool_description: str,
+) -> dict[str, Any]:
+    output_schema = _clip_selection_tool(
+        requested_count,
+        item_schema,
+        tool_description,
+    )["function"]["parameters"]
+    return _structured_model_request_options(
+        model,
+        tool_name=_CLIP_TOOL_NAME,
+        output_schema=output_schema,
+        description=tool_description,
+    )
 
 
 class TranscriptAnalyzer:
@@ -1053,11 +1165,11 @@ class TranscriptAnalyzer:
         resolved_content_type, editorial_guidance = _content_type_guidance(content_type)
         windows = build_highlight_windows(transcript, window_seconds)
         if len(windows) < 2:
-            raise AnalysisError(
+            raise InsufficientHighlightsError(
                 "The transcript does not contain enough populated highlight windows."
             )
         batches = [
-            windows[index : index + batch_windows]
+            (index, windows[index : index + batch_windows])
             for index in range(0, len(windows), batch_windows)
         ]
         moment_schema = {
@@ -1072,9 +1184,43 @@ class TranscriptAnalyzer:
             "required": ["moments"],
             "additionalProperties": False,
         }
-        proposed: list[HighlightMoment] = []
-        for batch_index, batch in enumerate(batches, start=1):
-            window_text = "\n".join(json.dumps(window) for window in batch)
+        proposed_batches: list[list[HighlightMoment]] = []
+        for batch_index, (batch_start, batch) in enumerate(batches, start=1):
+            screening_rows = []
+            for offset, window in enumerate(batch):
+                window_index = batch_start + offset
+                previous_window = windows[window_index - 1] if window_index > 0 else None
+                next_window = (
+                    windows[window_index + 1]
+                    if window_index + 1 < len(windows)
+                    else None
+                )
+                screening_rows.append(
+                    {
+                        "selectable_window": window,
+                        "context_before": (
+                            previous_window["text"]
+                            if previous_window is not None
+                            and abs(
+                                float(previous_window["end"])
+                                - float(window["start"])
+                            )
+                            <= 0.01
+                            else None
+                        ),
+                        "context_after": (
+                            next_window["text"]
+                            if next_window is not None
+                            and abs(
+                                float(next_window["start"])
+                                - float(window["end"])
+                            )
+                            <= 0.01
+                            else None
+                        ),
+                    }
+                )
+            window_text = "\n".join(json.dumps(row) for row in screening_rows)
             prompt = f"""You are screening fixed short windows from a video transcript.
 
 Content-type focus ({resolved_content_type.value}):
@@ -1083,8 +1229,10 @@ Content-type focus ({resolved_content_type.value}):
 Return a JSON object with a \"moments\" array. Select only windows that contain a
 genuinely interesting, funny, surprising, impressive, emotional, quotable, or
 visually promising beat. Skip weak, repetitive, transitional, incomplete, or
-contextless windows. Never change or combine timestamps: each returned start/end
-must exactly match one supplied window. Score each selected moment from 0 to 1 and
+contextless windows. Each row includes one selectable_window and the transcript text
+immediately before and after it. Adjacent context is evidence only and is not
+selectable. Never change or combine timestamps: each returned start/end must exactly
+match a selectable_window in this batch. Score each selected moment from 0 to 1 and
 briefly state its hook and selection reason. An empty moments array is correct when
 the batch contains nothing strong.
 
@@ -1100,29 +1248,24 @@ WINDOWS:
                 model=model,
                 output_schema=moment_schema,
                 description="Submit the strongest exact highlight windows from this batch.",
-                validator=lambda payload, allowed=batch: validate_highlight_moments(
-                    payload.get("moments", []) if isinstance(payload, dict) else [],
+                tool_name=_HIGHLIGHT_MOMENTS_TOOL_NAME,
+                validator=lambda payload, allowed=batch: validate_highlight_screening_payload(
+                    payload,
                     allowed_windows=allowed,
-                )
-                if isinstance(payload, dict) and payload.get("moments")
-                else [],
+                ),
                 temperature=0.1,
                 request_max_attempts=request_max_attempts,
             )
-            proposed.extend(result)
+            proposed_batches.append(result)
             if progress_callback:
                 progress_callback(batch_index, len(batches) + 1)
 
-        unique = {
-            (round(moment.start, 3), round(moment.end, 3)): moment
-            for moment in sorted(proposed, key=lambda item: item.score)
-        }
-        review_pool = sorted(
-            unique.values(),
-            key=lambda item: (-item.score, item.start),
-        )[: min(60, max(20, max_moments * 4))]
+        review_pool = select_diverse_highlight_pool(
+            proposed_batches,
+            limit=min(60, max(20, max_moments * 4)),
+        )
         if len(review_pool) < 2:
-            raise AnalysisError(
+            raise InsufficientHighlightsError(
                 "Fewer than two short windows were strong enough for a montage."
             )
 
@@ -1156,6 +1299,7 @@ APPROVED MOMENT POOL:
             model=model,
             output_schema=montage_schema,
             description="Submit one title, summary, and ordered whole-video montage.",
+            tool_name=_HIGHLIGHT_MONTAGE_TOOL_NAME,
             validator=lambda payload: validate_highlight_montage(
                 payload,
                 proposed_moments=review_pool,
@@ -1177,6 +1321,7 @@ APPROVED MOMENT POOL:
         model: str,
         output_schema: dict[str, Any],
         description: str,
+        tool_name: str,
         validator: StructuredValidator,
         temperature: float,
         request_max_attempts: int,
@@ -1225,12 +1370,23 @@ APPROVED MOMENT POOL:
                     "max_tokens": _MAX_ANALYSIS_OUTPUT_TOKENS,
                     "max_retries": max(0, request_max_attempts - 1),
                 }
+                request_options.update(
+                    _structured_model_request_options(
+                        model,
+                        tool_name=tool_name,
+                        output_schema=output_schema,
+                        description=description,
+                    )
+                )
                 if self._api_key is not None:
                     request_options["api_key"] = self._api_key
                 response = self._completion(**request_options)
                 finish_reason = _response_finish_reason(response)
-                response_content = _response_content(response)
-                return validator(extract_json_payload(response_content))
+                payload = _response_tool_payload(response, tool_name)
+                if payload is None:
+                    response_content = _response_content(response)
+                    payload = extract_json_payload(response_content)
+                return validator(payload)
             except AnalysisError as exc:
                 previous_content = response_content
                 last_error = (
@@ -1245,6 +1401,8 @@ APPROVED MOMENT POOL:
                     f"LiteLLM montage request failed for model '{model}': {exc}. "
                     "Check the active provider model and credentials."
                 ) from exc
+        if isinstance(last_error, InsufficientHighlightsError):
+            raise last_error
         raise AnalysisError(
             f"The model returned invalid montage data twice: {last_error}"
         )

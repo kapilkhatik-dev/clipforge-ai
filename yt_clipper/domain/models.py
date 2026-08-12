@@ -36,6 +36,8 @@ MAX_CLIP_DURATION_SECONDS: Final[int] = 60
 MAX_CLIP_COUNT: Final[int] = 20
 ANALYSIS_SCHEMA_VERSION: Final[int] = 7
 ANALYSIS_PROMPT_VERSION: Final[int] = 3
+MONTAGE_ANALYSIS_SCHEMA_VERSION: Final[int] = 1
+MONTAGE_ANALYSIS_PROMPT_VERSION: Final[int] = 1
 
 
 def _resolve_default_llm_api_key() -> SecretStr | None:
@@ -370,6 +372,7 @@ class AnalysisDocument(StrictModel):
 
 class MontageAnalysisDocument(StrictModel):
     schema_version: int = Field(ge=1)
+    analysis_prompt_version: int = Field(ge=1)
     video_id: str
     model: str
     analysis_backend: str = Field(min_length=1)

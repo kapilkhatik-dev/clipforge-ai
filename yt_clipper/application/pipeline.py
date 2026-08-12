@@ -9,10 +9,17 @@ from typing import Any
 
 from filelock import FileLock, Timeout
 
-from ..domain.errors import AnalysisError, ClipperError, DownloadError
+from ..domain.errors import (
+    AnalysisError,
+    ClipperError,
+    DownloadError,
+    InsufficientHighlightsError,
+)
 from ..domain.models import (
     ANALYSIS_PROMPT_VERSION,
     ANALYSIS_SCHEMA_VERSION,
+    MONTAGE_ANALYSIS_PROMPT_VERSION,
+    MONTAGE_ANALYSIS_SCHEMA_VERSION,
     AnalysisDocument,
     HighlightMontage,
     MontageAnalysisDocument,
@@ -31,7 +38,11 @@ from ..infrastructure.media_tools import (
     validate_ffmpeg_capabilities,
     validate_media_tools,
 )
-from ..services.analyzer import TranscriptAnalyzer, validate_clip_candidates
+from ..services.analyzer import (
+    TranscriptAnalyzer,
+    build_highlight_windows,
+    validate_clip_candidates,
+)
 from ..services.downloader import VideoDownloader
 from ..services.renderer import ClipRenderer
 from ..services.transcript import TranscriptService
@@ -198,8 +209,17 @@ class ClipPipeline:
             cached = MontageAnalysisDocument.model_validate_json(
                 path.read_text(encoding="utf-8")
             )
+            allowed_windows = {
+                (round(float(window["start"]), 3), round(float(window["end"]), 3))
+                for window in build_highlight_windows(
+                    transcript,
+                    self.config.highlight_window_seconds,
+                )
+            }
             if not (
-                cached.schema_version == 1
+                cached.schema_version == MONTAGE_ANALYSIS_SCHEMA_VERSION
+                and cached.analysis_prompt_version
+                == MONTAGE_ANALYSIS_PROMPT_VERSION
                 and cached.video_id == transcript.video_id
                 and cached.model == self.config.model
                 and cached.analysis_backend == self._analysis_backend_id()
@@ -219,6 +239,8 @@ class ClipPipeline:
                     moment.end <= transcript.duration_seconds + 0.01
                     and 0 < moment.duration
                     <= self.config.highlight_window_seconds + 0.01
+                    and (round(moment.start, 3), round(moment.end, 3))
+                    in allowed_windows
                     for moment in cached.montage.moments
                 )
             ):
@@ -355,33 +377,45 @@ class ClipPipeline:
                     "Screening short moments for a whole-video highlight montage",
                     progress=0,
                 )
-                montage = self._analyzer.find_highlight_montage(
-                    transcript=transcript,
-                    model=self.config.model,
-                    content_type=self.config.content_type,
-                    window_seconds=self.config.highlight_window_seconds,
-                    max_duration=self.config.highlight_montage_max_duration,
-                    max_moments=self.config.highlight_montage_max_moments,
-                    batch_windows=self.config.highlight_analysis_batch_windows,
-                    request_max_attempts=self.config.analysis_request_max_attempts,
-                    progress_callback=self._montage_analysis_progress,
-                )
-                atomic_write_text(
-                    montage_analysis_path,
-                    MontageAnalysisDocument(
-                        schema_version=1,
-                        video_id=transcript.video_id,
+                try:
+                    montage = self._analyzer.find_highlight_montage(
+                        transcript=transcript,
                         model=self.config.model,
-                        analysis_backend=self._analysis_backend_id(),
                         content_type=self.config.content_type,
                         window_seconds=self.config.highlight_window_seconds,
                         max_duration=self.config.highlight_montage_max_duration,
                         max_moments=self.config.highlight_montage_max_moments,
                         batch_windows=self.config.highlight_analysis_batch_windows,
-                        transcript_sha256=self._transcript_hash(transcript),
-                        montage=montage,
-                    ).model_dump_json(indent=2),
-                )
+                        request_max_attempts=self.config.analysis_request_max_attempts,
+                        progress_callback=self._montage_analysis_progress,
+                    )
+                except InsufficientHighlightsError as exc:
+                    LOGGER.info("Skipping optional highlight montage: %s", exc)
+                    montage_analysis_path.unlink(missing_ok=True)
+                    montage_analysis_path = None
+                    self._emit(
+                        PipelineStage.ANALYZE,
+                        f"No highlight montage generated: {exc}",
+                        progress=1,
+                    )
+                else:
+                    atomic_write_text(
+                        montage_analysis_path,
+                        MontageAnalysisDocument(
+                            schema_version=MONTAGE_ANALYSIS_SCHEMA_VERSION,
+                            analysis_prompt_version=MONTAGE_ANALYSIS_PROMPT_VERSION,
+                            video_id=transcript.video_id,
+                            model=self.config.model,
+                            analysis_backend=self._analysis_backend_id(),
+                            content_type=self.config.content_type,
+                            window_seconds=self.config.highlight_window_seconds,
+                            max_duration=self.config.highlight_montage_max_duration,
+                            max_moments=self.config.highlight_montage_max_moments,
+                            batch_windows=self.config.highlight_analysis_batch_windows,
+                            transcript_sha256=self._transcript_hash(transcript),
+                            montage=montage,
+                        ).model_dump_json(indent=2),
+                    )
             else:
                 self._emit(
                     PipelineStage.ANALYZE,
@@ -453,6 +487,8 @@ class ClipPipeline:
                     "Highlight montage ready",
                     progress=1,
                 )
+            elif self.config.highlight_montage:
+                self._renderer.cleanup_stale(video.work_dir / "montage", [])
 
         result = PipelineResult(
             video=video,

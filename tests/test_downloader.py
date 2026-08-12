@@ -245,6 +245,7 @@ def test_caches_normalized_original_youtube_thumbnail(
     thumbnail = downloader._ensure_original_thumbnail(metadata, tmp_path, force=False)
 
     assert thumbnail == tmp_path / "source-thumbnail.jpg"
+    assert thumbnail is not None
     assert thumbnail.read_bytes() == b"normalized-jpeg"
 
 

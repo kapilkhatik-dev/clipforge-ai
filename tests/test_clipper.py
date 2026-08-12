@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
+import pytest
+
+import yt_clipper.services.renderer as renderer_module
 from yt_clipper.domain.models import (
+    DownloadedVideo,
     HighlightMoment,
+    HighlightMontage,
+    TranscriptDocument,
+    TranscriptOrigin,
     TranscriptSegment,
     TranscriptWord,
     VideoLayout,
+    VideoMetadata,
 )
+from yt_clipper.infrastructure.media_tools import MediaProbe, MediaTools
 from yt_clipper.services.renderer import (
+    ClipRenderer,
     build_ass_document,
     build_caption_cues,
     build_thumbnail_ass_document,
     build_thumbnail_filter_graph,
-    build_montage_filter_graph,
     build_vertical_poster_ass_document,
     build_vertical_poster_filter_graph,
     build_video_filter_graph,
@@ -205,20 +217,125 @@ def test_montage_transcript_rebases_captions_across_non_contiguous_cuts() -> Non
     ]
 
 
-def test_montage_filter_trims_exact_windows_and_concatenates_audio_video() -> None:
-    moments = [
-        HighlightMoment(start=8, end=12, score=0.9, hook="B", reason="B"),
-        HighlightMoment(start=0, end=4, score=0.8, hook="A", reason="A"),
-    ]
+def test_montage_renders_seeked_segments_sequentially_in_editorial_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    source_path = work_dir / "source.mp4"
+    source_path.write_bytes(b"source")
+    metadata = VideoMetadata(
+        video_id="abcdefghijk",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Source",
+        duration_seconds=20,
+    )
+    video = DownloadedVideo(
+        metadata=metadata,
+        video_path=source_path,
+        metadata_path=work_dir / "metadata.json",
+        work_dir=work_dir,
+    )
+    transcript = TranscriptDocument(
+        video_id=metadata.video_id,
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=20,
+        segments=[
+            TranscriptSegment(start=0, end=4, text="First moment"),
+            TranscriptSegment(start=12, end=16, text="Second moment"),
+        ],
+    )
+    montage = HighlightMontage(
+        title="Editorial order",
+        summary="The late moment intentionally opens the montage.",
+        moments=[
+            HighlightMoment(start=12, end=16, score=0.9, hook="B", reason="B"),
+            HighlightMoment(start=0, end=4, score=0.8, hook="A", reason="A"),
+        ],
+    )
+    commands: list[list[str]] = []
+    segment_captions: list[str] = []
+    concat_document = ""
 
-    graph = build_montage_filter_graph(
-        moments,
-        VideoLayout.FILL_CROP,
-        1080,
-        1920,
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path,
+        **_settings: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal concat_document
+        commands.append(command)
+        output_path = Path(command[-1])
+        if output_path.name.startswith("segment-"):
+            segment_captions.append(
+                (cwd / "captions.ass").read_text(encoding="utf-8-sig")
+            )
+        if "concat" in command:
+            concat_document = Path(command[command.index("-i") + 1]).read_text(
+                encoding="utf-8"
+            )
+        output_path.write_bytes(b"rendered")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(renderer_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        renderer_module,
+        "probe_media",
+        lambda *_args: MediaProbe(
+            duration_seconds=8,
+            has_video=True,
+            has_audio=True,
+            has_attached_picture=True,
+        ),
+    )
+    monkeypatch.setattr(
+        ClipRenderer,
+        "_ensure_vertical_poster",
+        lambda _self, _video, _candidate, output_path, _manifest_path, force: (
+            output_path.with_suffix(".poster.jpg")
+        ),
     )
 
-    assert "trim=start=8.000:end=12.000" in graph
-    assert "atrim=start=0.000:end=4.000" in graph
-    assert "[v0][a0][v1][a1]concat=n=2:v=1:a=1" in graph
-    assert graph.count("subtitles=filename='captions.ass'") == 1
+    result = ClipRenderer(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    ).render_montage(
+        video=video,
+        transcript=transcript,
+        montage=montage,
+        output_dir=work_dir / "montage",
+    )
+
+    segment_commands = [
+        command
+        for command in commands
+        if Path(command[-1]).name.startswith("segment-")
+    ]
+    assert result.is_file()
+    assert len(segment_commands) == 2
+    assert [command[command.index("-ss") + 1] for command in segment_commands] == [
+        "12.000",
+        "0.000",
+    ]
+    assert [command[command.index("-t") + 1] for command in segment_commands] == [
+        "4.000",
+        "4.000",
+    ]
+    assert all(
+        "trim=" not in command[command.index("-filter_complex") + 1]
+        for command in segment_commands
+    )
+    assert all(
+        "subtitles=filename='captions.ass'"
+        in command[command.index("-filter_complex") + 1]
+        for command in segment_commands
+    )
+    assert "Second moment" in segment_captions[0]
+    assert "First moment" in segment_captions[1]
+    assert "0:00:00.00,0:00:04.00" in segment_captions[0]
+    assert concat_document == "file 'segment-00.mp4'\nfile 'segment-01.mp4'\n"
+    concat_command = next(command for command in commands if "concat" in command)
+    assert concat_command[concat_command.index("-c") + 1] == "copy"

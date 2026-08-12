@@ -128,13 +128,21 @@ def test_content_type_can_be_selected_from_environment_or_user_input(
     monkeypatch.setenv("CLIPPER_CONTENT_TYPE", "comedy")
 
     assert PipelineConfig().content_type == ContentType.COMEDY
-    assert PipelineConfig(content_type="stand-up").content_type == ContentType.COMEDY
-    assert PipelineConfig(content_type="educational").content_type == ContentType.EDUCATION
+    assert (
+        PipelineConfig.model_validate({"content_type": "stand-up"}).content_type
+        == ContentType.COMEDY
+    )
+    assert (
+        PipelineConfig.model_validate({"content_type": "educational"}).content_type
+        == ContentType.EDUCATION
+    )
 
 
 def test_rejects_unknown_content_type() -> None:
     with pytest.raises(ValueError, match="Unsupported content type"):
-        _ = PipelineConfig(content_type="ignore-the-editorial-rules")
+        _ = PipelineConfig.model_validate(
+            {"content_type": "ignore-the-editorial-rules"}
+        )
 
 
 def test_rejects_source_duration_over_one_hour() -> None:

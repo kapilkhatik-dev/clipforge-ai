@@ -315,9 +315,9 @@ result = run(video_url, content_type="comedy")
 ## Whole-video highlight montage
 
 Set `CLIPPER_HIGHLIGHT_MONTAGE=true` to keep the existing continuous clips and also
-generate one extra montage from the best moments across the complete video. This is
-opt-in, so enabling or disabling it does not change the current clip-selection or
-provider paths.
+generate one extra montage from the best transcript-backed moments across the
+source. This is opt-in, so enabling or disabling it does not change the current
+clip-selection or provider paths.
 
 The montage workflow divides the timestamped transcript into exact 4-second windows
 (configurable from 3–6 seconds), sends those windows to the active Codex or API
@@ -326,6 +326,10 @@ editorial pass over the strongest results. The final pass generates a title and
 orders a varied set of moments into one video of at most 60 seconds. FFmpeg trims
 the exact source ranges, concatenates their audio and video, and rebases captions so
 they remain synchronized after every cut.
+
+Only windows containing usable transcript text are eligible for the current AI
+screening pass. Silent reactions, visual-only jokes, action, or other nonverbal-only
+moments are outside the current analysis and require a future visual/audio model.
 
 ```python
 from yt_clipper import PipelineConfig

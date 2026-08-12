@@ -7,11 +7,15 @@ import pytest
 
 import yt_clipper.application.pipeline as pipeline_module
 from yt_clipper import ClipPipeline, ContentType, PipelineConfig, WhisperDevice
+from yt_clipper.domain.errors import AnalysisError, InsufficientHighlightsError
 from yt_clipper.domain.models import (
+    MONTAGE_ANALYSIS_PROMPT_VERSION,
+    MONTAGE_ANALYSIS_SCHEMA_VERSION,
     ClipCandidate,
     DownloadedVideo,
     HighlightMoment,
     HighlightMontage,
+    MontageAnalysisDocument,
     TranscriptDocument,
     TranscriptMode,
     TranscriptOrigin,
@@ -434,7 +438,6 @@ def test_pipeline_generates_opt_in_whole_video_highlight_montage(
         analyzer=FakeAnalyzer(),  # pyright: ignore[reportArgumentType]
         renderer=FakeRenderer(),  # pyright: ignore[reportArgumentType]
     )
-
     result = pipeline.run(metadata.source_url)
 
     analysis_settings = observed["montage_analysis"]
@@ -443,8 +446,201 @@ def test_pipeline_generates_opt_in_whole_video_highlight_montage(
     assert analysis_settings["max_duration"] == 60
     assert result.montage == montage
     assert result.montage_analysis_path == work_dir / "montage.json"
+    assert result.montage_analysis_path is not None
     assert result.montage_analysis_path.is_file()
     assert result.montage_video_path == work_dir / "montage" / "highlight-montage-best.mp4"
+    assert result.montage_video_path is not None
     assert result.montage_thumbnail_path == result.montage_video_path.with_suffix(
         ".thumbnail.jpg"
     )
+
+
+def test_montage_cache_requires_current_version_and_exact_highlight_windows(
+    tmp_path: Path,
+) -> None:
+    transcript = TranscriptDocument(
+        video_id="cache-video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=12,
+        segments=[
+            TranscriptSegment(
+                start=0,
+                end=12,
+                text="one two three four five six seven eight nine ten eleven twelve",
+            )
+        ],
+    )
+    config = PipelineConfig(output_dir=tmp_path, highlight_montage=True)
+    pipeline = object.__new__(ClipPipeline)
+    pipeline.config = config
+
+    class FakeAnalyzer:
+        @staticmethod
+        def analysis_backend_id(model: str) -> str:
+            return model
+
+    pipeline._analyzer = FakeAnalyzer()  # type: ignore[attr-defined]
+    cache_path = tmp_path / "montage.json"
+
+    def write_cache(
+        moments: list[HighlightMoment],
+        *,
+        prompt_version: int = MONTAGE_ANALYSIS_PROMPT_VERSION,
+    ) -> None:
+        document = MontageAnalysisDocument(
+            schema_version=MONTAGE_ANALYSIS_SCHEMA_VERSION,
+            analysis_prompt_version=prompt_version,
+            video_id=transcript.video_id,
+            model=config.model,
+            analysis_backend=config.model,
+            content_type=config.content_type,
+            window_seconds=config.highlight_window_seconds,
+            max_duration=config.highlight_montage_max_duration,
+            max_moments=config.highlight_montage_max_moments,
+            batch_windows=config.highlight_analysis_batch_windows,
+            transcript_sha256=pipeline._transcript_hash(transcript),
+            montage=HighlightMontage(
+                title="Cached montage",
+                summary="Two cached moments.",
+                moments=moments,
+            ),
+        )
+        cache_path.write_text(document.model_dump_json(), encoding="utf-8")
+
+    exact_moments = [
+        HighlightMoment(start=0, end=4, score=0.9, hook="A", reason="A"),
+        HighlightMoment(start=8, end=12, score=0.8, hook="B", reason="B"),
+    ]
+    write_cache(exact_moments)
+    assert pipeline._load_cached_montage(cache_path, transcript) is not None
+
+    arbitrary_moments = [
+        HighlightMoment(start=1, end=4, score=0.9, hook="A", reason="A"),
+        exact_moments[1],
+    ]
+    write_cache(arbitrary_moments)
+    assert pipeline._load_cached_montage(cache_path, transcript) is None
+
+    write_cache(
+        exact_moments,
+        prompt_version=MONTAGE_ANALYSIS_PROMPT_VERSION + 1,
+    )
+    assert pipeline._load_cached_montage(cache_path, transcript) is None
+
+
+@pytest.mark.parametrize(
+    ("montage_error", "is_expected_skip"),
+    [
+        (InsufficientHighlightsError("not enough strong moments"), True),
+        (AnalysisError("provider response failed"), False),
+    ],
+)
+def test_pipeline_only_skips_expected_insufficient_highlights(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    montage_error: AnalysisError,
+    is_expected_skip: bool,
+) -> None:
+    metadata = VideoMetadata(
+        video_id="montage-skip",
+        source_url="https://www.youtube.com/watch?v=montage-skip",
+        title="Montage skip test",
+        duration_seconds=60,
+    )
+    work_dir = tmp_path / metadata.video_id
+    video = DownloadedVideo(
+        metadata=metadata,
+        video_path=work_dir / "source.mp4",
+        metadata_path=work_dir / "metadata.json",
+        work_dir=work_dir,
+    )
+    transcript = TranscriptDocument(
+        video_id=metadata.video_id,
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=60,
+        segments=[TranscriptSegment(start=0, end=60, text="Continuous transcript")],
+    )
+    candidate = ClipCandidate(
+        title="Continuous clip",
+        start=0,
+        end=60,
+        score=0.9,
+        hook="Hook",
+        reason="Reason",
+        standalone=True,
+        topic="Topic",
+        opening_context="Opening",
+        closing_resolution="Closing",
+    )
+    rendered: list[str] = []
+    cleanup_calls: list[tuple[Path, list[Path]]] = []
+
+    class FakeDownloader:
+        def inspect(self, _url: str, **_settings: object) -> VideoMetadata:
+            return metadata
+
+        def download(self, _metadata: VideoMetadata, **_settings: object) -> DownloadedVideo:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            return video
+
+    class FakeTranscriptService:
+        def get_transcript(
+            self, _video: DownloadedVideo, **_settings: object
+        ) -> tuple[TranscriptDocument, Path]:
+            return transcript, work_dir / "transcript.json"
+
+    class FakeAnalyzer:
+        def find_clips(self, **_settings: object) -> list[ClipCandidate]:
+            return [candidate]
+
+        def find_highlight_montage(self, **_settings: object) -> HighlightMontage:
+            raise montage_error
+
+    class FakeRenderer:
+        def render(self, *, output_dir: Path, **_settings: object) -> Path:
+            rendered.append("continuous")
+            return output_dir / "01-continuous.mp4"
+
+        def cleanup_stale(
+            self, output_dir: Path, retained_paths: list[Path]
+        ) -> None:
+            cleanup_calls.append((output_dir, retained_paths))
+
+    monkeypatch.setattr(pipeline_module, "validate_media_tools", lambda _tools: None)
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_ffmpeg_capabilities",
+        lambda _tools: None,
+    )
+    pipeline = ClipPipeline(
+        PipelineConfig(output_dir=tmp_path, highlight_montage=True),
+        media_tools=MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe")),
+        downloader=FakeDownloader(),  # pyright: ignore[reportArgumentType]
+        transcript_service=FakeTranscriptService(),  # pyright: ignore[reportArgumentType]
+        analyzer=FakeAnalyzer(),  # pyright: ignore[reportArgumentType]
+        renderer=FakeRenderer(),  # pyright: ignore[reportArgumentType]
+    )
+    stale_montage_cache = work_dir / "montage.json"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    stale_montage_cache.write_text("not valid montage JSON", encoding="utf-8")
+
+    if not is_expected_skip:
+        with pytest.raises(AnalysisError, match="provider response failed"):
+            pipeline.run(metadata.source_url)
+        assert rendered == []
+        return
+
+    result = pipeline.run(metadata.source_url)
+    assert rendered == ["continuous"]
+    assert len(result.clip_paths) == 1
+    assert result.montage is None
+    assert result.montage_analysis_path is None
+    assert result.montage_video_path is None
+    assert not stale_montage_cache.exists()
+    assert cleanup_calls[-1] == (work_dir / "montage", [])

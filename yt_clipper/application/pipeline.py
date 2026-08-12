@@ -9,11 +9,20 @@ from typing import Any
 
 from filelock import FileLock, Timeout
 
-from ..domain.errors import AnalysisError, ClipperError, DownloadError
+from ..domain.errors import (
+    AnalysisError,
+    ClipperError,
+    DownloadError,
+    InsufficientHighlightsError,
+)
 from ..domain.models import (
     ANALYSIS_PROMPT_VERSION,
     ANALYSIS_SCHEMA_VERSION,
+    MONTAGE_ANALYSIS_PROMPT_VERSION,
+    MONTAGE_ANALYSIS_SCHEMA_VERSION,
     AnalysisDocument,
+    HighlightMontage,
+    MontageAnalysisDocument,
     PipelineConfig,
     PipelineEvent,
     PipelineResult,
@@ -29,7 +38,11 @@ from ..infrastructure.media_tools import (
     validate_ffmpeg_capabilities,
     validate_media_tools,
 )
-from ..services.analyzer import TranscriptAnalyzer, validate_clip_candidates
+from ..services.analyzer import (
+    TranscriptAnalyzer,
+    build_highlight_windows,
+    validate_clip_candidates,
+)
 from ..services.downloader import VideoDownloader
 from ..services.renderer import ClipRenderer
 from ..services.transcript import TranscriptService
@@ -113,6 +126,16 @@ class ClipPipeline:
             total=total,
         )
 
+    def _montage_analysis_progress(self, current: int, total: int) -> None:
+        progress = current / total if total else 0.0
+        self._emit(
+            PipelineStage.ANALYZE,
+            f"Screened highlight batch {current} of {total}",
+            progress=progress,
+            current=current,
+            total=total,
+        )
+
     @staticmethod
     def _transcript_hash(transcript: TranscriptDocument) -> str:
         serialized = transcript.model_dump_json(exclude_none=False)
@@ -173,6 +196,58 @@ class ClipPipeline:
             return cached.model_copy(update={"candidates": validated})
         except (AnalysisError, ValueError, OSError):
             LOGGER.warning("Ignoring invalid analysis cache at %s", path)
+            return None
+
+    def _load_cached_montage(
+        self,
+        path: Path,
+        transcript: TranscriptDocument,
+    ) -> HighlightMontage | None:
+        if not path.is_file() or self.config.force:
+            return None
+        try:
+            cached = MontageAnalysisDocument.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
+            allowed_windows = {
+                (round(float(window["start"]), 3), round(float(window["end"]), 3))
+                for window in build_highlight_windows(
+                    transcript,
+                    self.config.highlight_window_seconds,
+                )
+            }
+            if not (
+                cached.schema_version == MONTAGE_ANALYSIS_SCHEMA_VERSION
+                and cached.analysis_prompt_version
+                == MONTAGE_ANALYSIS_PROMPT_VERSION
+                and cached.video_id == transcript.video_id
+                and cached.model == self.config.model
+                and cached.analysis_backend == self._analysis_backend_id()
+                and cached.content_type == self.config.content_type
+                and cached.window_seconds == self.config.highlight_window_seconds
+                and cached.max_duration
+                == self.config.highlight_montage_max_duration
+                and cached.max_moments == self.config.highlight_montage_max_moments
+                and cached.batch_windows
+                == self.config.highlight_analysis_batch_windows
+                and cached.transcript_sha256 == self._transcript_hash(transcript)
+                and cached.montage.duration
+                <= self.config.highlight_montage_max_duration + 0.01
+                and len(cached.montage.moments)
+                <= self.config.highlight_montage_max_moments
+                and all(
+                    moment.end <= transcript.duration_seconds + 0.01
+                    and 0 < moment.duration
+                    <= self.config.highlight_window_seconds + 0.01
+                    and (round(moment.start, 3), round(moment.end, 3))
+                    in allowed_windows
+                    for moment in cached.montage.moments
+                )
+            ):
+                return None
+            return cached.montage
+        except (ValueError, OSError):
+            LOGGER.warning("Ignoring invalid montage analysis cache at %s", path)
             return None
 
     def run(self, url: str) -> PipelineResult:
@@ -291,9 +366,69 @@ class ClipPipeline:
             atomic_write_text(candidates_path, analysis.model_dump_json(indent=2))
             self._emit(PipelineStage.ANALYZE, "Clip selections ready", progress=1)
 
+        montage: HighlightMontage | None = None
+        montage_analysis_path: Path | None = None
+        if self.config.highlight_montage:
+            montage_analysis_path = video.work_dir / "montage.json"
+            montage = self._load_cached_montage(montage_analysis_path, transcript)
+            if montage is None:
+                self._emit(
+                    PipelineStage.ANALYZE,
+                    "Screening short moments for a whole-video highlight montage",
+                    progress=0,
+                )
+                try:
+                    montage = self._analyzer.find_highlight_montage(
+                        transcript=transcript,
+                        model=self.config.model,
+                        content_type=self.config.content_type,
+                        window_seconds=self.config.highlight_window_seconds,
+                        max_duration=self.config.highlight_montage_max_duration,
+                        max_moments=self.config.highlight_montage_max_moments,
+                        batch_windows=self.config.highlight_analysis_batch_windows,
+                        request_max_attempts=self.config.analysis_request_max_attempts,
+                        progress_callback=self._montage_analysis_progress,
+                    )
+                except InsufficientHighlightsError as exc:
+                    LOGGER.info("Skipping optional highlight montage: %s", exc)
+                    montage_analysis_path.unlink(missing_ok=True)
+                    montage_analysis_path = None
+                    self._emit(
+                        PipelineStage.ANALYZE,
+                        f"No highlight montage generated: {exc}",
+                        progress=1,
+                    )
+                else:
+                    atomic_write_text(
+                        montage_analysis_path,
+                        MontageAnalysisDocument(
+                            schema_version=MONTAGE_ANALYSIS_SCHEMA_VERSION,
+                            analysis_prompt_version=MONTAGE_ANALYSIS_PROMPT_VERSION,
+                            video_id=transcript.video_id,
+                            model=self.config.model,
+                            analysis_backend=self._analysis_backend_id(),
+                            content_type=self.config.content_type,
+                            window_seconds=self.config.highlight_window_seconds,
+                            max_duration=self.config.highlight_montage_max_duration,
+                            max_moments=self.config.highlight_montage_max_moments,
+                            batch_windows=self.config.highlight_analysis_batch_windows,
+                            transcript_sha256=self._transcript_hash(transcript),
+                            montage=montage,
+                        ).model_dump_json(indent=2),
+                    )
+            else:
+                self._emit(
+                    PipelineStage.ANALYZE,
+                    "Using cached highlight montage analysis",
+                    progress=1,
+                )
+
         clip_paths = []
         thumbnail_paths = []
         poster_paths = []
+        montage_video_path: Path | None = None
+        montage_thumbnail_path: Path | None = None
+        montage_poster_path: Path | None = None
         if not self.config.analyze_only:
             clips_dir = video.work_dir / "clips"
             total = len(candidates)
@@ -325,6 +460,35 @@ class ClipPipeline:
                 current=total,
                 total=total,
             )
+            if montage is not None:
+                self._emit(
+                    PipelineStage.RENDER,
+                    f"Rendering highlight montage: {montage.title}",
+                    progress=0,
+                )
+                montage_video_path = self._renderer.render_montage(
+                    video=video,
+                    transcript=transcript,
+                    montage=montage,
+                    output_dir=video.work_dir / "montage",
+                    video_layout=self.config.video_layout,
+                    force=self.config.force,
+                )
+                self._renderer.cleanup_stale(
+                    montage_video_path.parent,
+                    [montage_video_path],
+                )
+                montage_thumbnail_path = montage_video_path.with_suffix(
+                    ".thumbnail.jpg"
+                )
+                montage_poster_path = montage_video_path.with_suffix(".poster.jpg")
+                self._emit(
+                    PipelineStage.RENDER,
+                    "Highlight montage ready",
+                    progress=1,
+                )
+            elif self.config.highlight_montage:
+                self._renderer.cleanup_stale(video.work_dir / "montage", [])
 
         result = PipelineResult(
             video=video,
@@ -335,6 +499,11 @@ class ClipPipeline:
             clip_paths=clip_paths,
             thumbnail_paths=thumbnail_paths,
             poster_paths=poster_paths,
+            montage=montage,
+            montage_analysis_path=montage_analysis_path,
+            montage_video_path=montage_video_path,
+            montage_thumbnail_path=montage_thumbnail_path,
+            montage_poster_path=montage_poster_path,
         )
         self._emit(PipelineStage.COMPLETE, "Pipeline complete", progress=1)
         return result

@@ -15,6 +15,8 @@ from ..domain.errors import MediaProbeError, RenderError
 from ..domain.models import (
     ClipCandidate,
     DownloadedVideo,
+    HighlightMoment,
+    HighlightMontage,
     TranscriptDocument,
     TranscriptSegment,
     TranscriptWord,
@@ -96,6 +98,36 @@ def clip_transcript_segments(
                 )
             )
     return clipped
+
+
+def montage_transcript_segments(
+    segments: list[TranscriptSegment],
+    moments: list[HighlightMoment],
+) -> list[TranscriptSegment]:
+    """Rebase source transcript cues onto the montage's concatenated timeline."""
+    rebased: list[TranscriptSegment] = []
+    cursor = 0.0
+    for moment in moments:
+        for segment in clip_transcript_segments(segments, moment.start, moment.end):
+            rebased.append(
+                segment.model_copy(
+                    update={
+                        "start": segment.start + cursor,
+                        "end": segment.end + cursor,
+                        "words": [
+                            word.model_copy(
+                                update={
+                                    "start": word.start + cursor,
+                                    "end": word.end + cursor,
+                                }
+                            )
+                            for word in segment.words
+                        ],
+                    }
+                )
+            )
+        cursor += moment.duration
+    return rebased
 
 
 def _split_words(words: list[str], maximum_words: int = 7) -> list[list[str]]:
@@ -894,6 +926,347 @@ class ClipRenderer:
         self._ensure_vertical_poster(
             video,
             candidate,
+            output_path,
+            manifest_path,
+            force=force,
+        )
+        return output_path
+
+    def render_montage(
+        self,
+        video: DownloadedVideo,
+        transcript: TranscriptDocument,
+        montage: HighlightMontage,
+        output_dir: Path,
+        video_layout: VideoLayout = VideoLayout.FILL_CROP,
+        force: bool = False,
+        width: int = 1080,
+        height: int = 1920,
+    ) -> Path:
+        """Render non-contiguous AI-selected moments into one polished short video."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = (
+            output_dir / f"highlight-montage-{slugify(montage.title)}.mp4"
+        ).resolve()
+        thumbnail_path = output_path.with_suffix(".thumbnail.jpg")
+        manifest_path = output_path.with_suffix(".render.json")
+        representative = montage.moments[0]
+        artwork_candidate = ClipCandidate(
+            title=montage.title,
+            start=representative.start,
+            end=representative.end,
+            score=max(moment.score for moment in montage.moments),
+            hook=representative.hook,
+            reason=montage.summary,
+        )
+        try:
+            render_fingerprint = fingerprint_payload(
+                {
+                    "schema_version": 1,
+                    "source": fingerprint_file(video.video_path),
+                    "source_thumbnail": (
+                        fingerprint_file(video.thumbnail_path)
+                        if video.thumbnail_path and video.thumbnail_path.is_file()
+                        else "fallback-source-frame"
+                    ),
+                    "transcript": transcript.model_dump(mode="json"),
+                    "montage": montage.model_dump(mode="json"),
+                    "video_layout": video_layout.value,
+                    "width": width,
+                    "height": height,
+                    "caption_style": "bold-yellow-charcoal-outline-v2",
+                    "montage_style": "bounded-segment-encode-concat-v2",
+                }
+            )
+        except OSError as exc:
+            raise RenderError(f"Could not fingerprint montage inputs: {exc}") from exc
+
+        if not force and self._cached_output_is_valid(
+            output_path,
+            thumbnail_path,
+            manifest_path,
+            render_fingerprint,
+            montage.duration,
+        ):
+            self._ensure_vertical_poster(
+                video,
+                artwork_candidate,
+                output_path,
+                manifest_path,
+                force=False,
+            )
+            return output_path
+
+        for path in (output_path, thumbnail_path, manifest_path):
+            path.unlink(missing_ok=True)
+        temp_root = video.work_dir / "temp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="montage-", dir=temp_root) as temp:
+            temp_dir = Path(temp)
+            caption_path = temp_dir / "captions.ass"
+            concat_path = temp_dir / "segments.txt"
+            thumbnail_title_path = temp_dir / "thumbnail-title.ass"
+            temporary_thumbnail = temp_dir / "thumbnail.jpg"
+            encoded_output = temp_dir / "encoded.mp4"
+            temporary_output = temp_dir / "render.mp4"
+            thumbnail_title_path.write_text(
+                build_thumbnail_ass_document(montage.title),
+                encoding="utf-8-sig",
+            )
+
+            thumbnail_source = (
+                video.thumbnail_path
+                if video.thumbnail_path and video.thumbnail_path.is_file()
+                else video.video_path
+            )
+            thumbnail_command = [
+                str(self._media_tools.ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+            ]
+            if thumbnail_source == video.video_path:
+                thumbnail_command.extend(
+                    [
+                        "-ss",
+                        f"{representative.start + representative.duration / 2:.3f}",
+                    ]
+                )
+            thumbnail_command.extend(
+                [
+                    "-i",
+                    str(thumbnail_source.resolve()),
+                    "-vf",
+                    build_thumbnail_filter_graph(),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    str(temporary_thumbnail),
+                ]
+            )
+            try:
+                subprocess.run(
+                    thumbnail_command,
+                    cwd=temp_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                )
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                stderr = getattr(exc, "stderr", "") or ""
+                raise RenderError(
+                    "FFmpeg failed while creating the montage thumbnail: "
+                    + ("\n".join(stderr.strip().splitlines()[-12:]) or str(exc))
+                ) from exc
+
+            segment_paths: list[Path] = []
+            for index, moment in enumerate(montage.moments):
+                caption_path.write_text(
+                    build_ass_document(
+                        clip_transcript_segments(
+                            transcript.segments,
+                            moment.start,
+                            moment.end,
+                        ),
+                        width=width,
+                        height=height,
+                    ),
+                    encoding="utf-8-sig",
+                )
+                segment_path = temp_dir / f"segment-{index:02d}.mp4"
+                segment_paths.append(segment_path)
+                segment_command = [
+                    str(self._media_tools.ffmpeg),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-ss",
+                    f"{moment.start:.3f}",
+                    "-t",
+                    f"{moment.duration:.3f}",
+                    "-i",
+                    str(video.video_path.resolve()),
+                    "-filter_complex",
+                    build_video_filter_graph(video_layout, width, height),
+                    "-map",
+                    "[video]",
+                    "-map",
+                    "0:a:0",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "medium",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    "-shortest",
+                    str(segment_path),
+                ]
+                try:
+                    subprocess.run(
+                        segment_command,
+                        cwd=temp_dir,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                except (OSError, subprocess.CalledProcessError) as exc:
+                    stderr = getattr(exc, "stderr", "") or ""
+                    raise RenderError(
+                        f"FFmpeg failed while rendering highlight moment {index + 1}: "
+                        + ("\n".join(stderr.strip().splitlines()[-12:]) or str(exc))
+                    ) from exc
+                if not segment_path.is_file():
+                    raise RenderError(
+                        f"FFmpeg did not create highlight moment {index + 1}."
+                    )
+
+            concat_path.write_text(
+                "".join(f"file '{path.name}'\n" for path in segment_paths),
+                encoding="utf-8",
+            )
+            concat_command = [
+                str(self._media_tools.ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(encoded_output),
+            ]
+            try:
+                subprocess.run(
+                    concat_command,
+                    cwd=temp_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                )
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                stderr = getattr(exc, "stderr", "") or ""
+                raise RenderError(
+                    "FFmpeg failed while joining the highlight moments: "
+                    + ("\n".join(stderr.strip().splitlines()[-12:]) or str(exc))
+                ) from exc
+
+            mux_command = [
+                str(self._media_tools.ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(encoded_output),
+                "-i",
+                str(temporary_thumbnail),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-map",
+                "1:v:0",
+                "-c",
+                "copy",
+                "-disposition:v:1",
+                "attached_pic",
+                "-metadata",
+                f"title={montage.title}",
+                "-metadata:s:v:1",
+                f"title={montage.title}",
+                "-metadata:s:v:1",
+                "comment=Cover (front)",
+                "-movflags",
+                "+faststart",
+                str(temporary_output),
+            ]
+            try:
+                subprocess.run(
+                    mux_command,
+                    cwd=temp_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                )
+                probe = probe_media(self._media_tools, temporary_output)
+            except (
+                OSError,
+                MediaProbeError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                raise RenderError(
+                    f"Could not finalize the highlight montage: {exc}"
+                ) from exc
+            if (
+                not probe.has_video
+                or not probe.has_attached_picture
+                or abs(probe.duration_seconds - montage.duration) > 0.75
+            ):
+                raise RenderError(
+                    "Rendered highlight montage has invalid streams, artwork, or duration."
+                )
+            os.replace(temporary_output, output_path)
+            os.replace(temporary_thumbnail, thumbnail_path)
+            atomic_write_text(
+                manifest_path,
+                json.dumps(
+                    {
+                        "schema_version": _RENDER_SCHEMA_VERSION,
+                        "video_layout": video_layout.value,
+                        "render_fingerprint": render_fingerprint,
+                        "output_fingerprint": fingerprint_file(output_path),
+                        "thumbnail_fingerprint": fingerprint_file(thumbnail_path),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+
+        self._ensure_vertical_poster(
+            video,
+            artwork_candidate,
             output_path,
             manifest_path,
             force=force,

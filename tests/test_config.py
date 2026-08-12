@@ -30,6 +30,7 @@ def isolate_llm_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "CLIPPER_ANTHROPIC_MODEL",
         "CLIPPER_MODEL",
         "CLIPPER_CONTENT_TYPE",
+        "CLIPPER_HIGHLIGHT_MONTAGE",
         "CLIPPER_CODEX_BINARY",
         "CLIPPER_CODEX_TIMEOUT_SECONDS",
         "NVIDIA_NIM_API_KEY",
@@ -89,19 +90,59 @@ def test_omitted_clip_count_enables_automatic_selection() -> None:
     assert PipelineConfig(clip_count=None).clip_count is None
 
 
+def test_highlight_montage_is_opt_in_and_has_bounded_short_windows() -> None:
+    default = PipelineConfig()
+    enabled = PipelineConfig(
+        highlight_montage=True,
+        highlight_window_seconds=5,
+        highlight_montage_max_duration=45,
+        highlight_montage_max_moments=9,
+        highlight_analysis_batch_windows=40,
+    )
+
+    assert default.highlight_montage is False
+    assert enabled.highlight_montage is True
+    assert enabled.highlight_window_seconds == 5
+    assert enabled.highlight_montage_max_duration == 45
+    assert enabled.highlight_montage_max_moments == 9
+    assert enabled.highlight_analysis_batch_windows == 40
+
+    with pytest.raises(ValueError, match="greater than or equal to 12"):
+        PipelineConfig(highlight_montage_max_duration=11.9)
+
+
+def test_highlight_montage_can_be_enabled_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPPER_HIGHLIGHT_MONTAGE", "true")
+    assert PipelineConfig().highlight_montage is True
+
+    monkeypatch.setenv("CLIPPER_HIGHLIGHT_MONTAGE", "maybe")
+    with pytest.raises(ValueError, match="CLIPPER_HIGHLIGHT_MONTAGE"):
+        PipelineConfig()
+
+
 def test_content_type_can_be_selected_from_environment_or_user_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CLIPPER_CONTENT_TYPE", "comedy")
 
     assert PipelineConfig().content_type == ContentType.COMEDY
-    assert PipelineConfig(content_type="stand-up").content_type == ContentType.COMEDY
-    assert PipelineConfig(content_type="educational").content_type == ContentType.EDUCATION
+    assert (
+        PipelineConfig.model_validate({"content_type": "stand-up"}).content_type
+        == ContentType.COMEDY
+    )
+    assert (
+        PipelineConfig.model_validate({"content_type": "educational"}).content_type
+        == ContentType.EDUCATION
+    )
 
 
 def test_rejects_unknown_content_type() -> None:
     with pytest.raises(ValueError, match="Unsupported content type"):
-        _ = PipelineConfig(content_type="ignore-the-editorial-rules")
+        _ = PipelineConfig.model_validate(
+            {"content_type": "ignore-the-editorial-rules"}
+        )
 
 
 def test_rejects_source_duration_over_one_hour() -> None:

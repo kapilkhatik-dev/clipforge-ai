@@ -33,5 +33,9 @@ class AnalysisError(ClipperError):
     """The language-model analysis failed or returned unusable data."""
 
 
+class InsufficientHighlightsError(AnalysisError):
+    """No eligible highlight set was found for the optional montage."""
+
+
 class RenderError(ClipperError):
     """FFmpeg failed to render a clip."""

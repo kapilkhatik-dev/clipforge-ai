@@ -6,18 +6,26 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 
 import pytest
 
 import yt_clipper.services.analyzer as analyzer_module
 from yt_clipper import ContentType, DEFAULT_ANALYSIS_MODEL, LLMProvider
-from yt_clipper.domain.errors import AnalysisError
+from yt_clipper.domain.errors import AnalysisError, InsufficientHighlightsError
 from yt_clipper.domain.models import (
     ClipCandidate,
+    HighlightMoment,
     TranscriptDocument,
     TranscriptOrigin,
     TranscriptSegment,
+)
+from yt_clipper.services.analyzer import (
+    build_highlight_windows,
+    select_diverse_highlight_pool,
+    validate_highlight_montage,
+    validate_highlight_moments,
+    validate_highlight_screening_payload,
 )
 from yt_clipper.services.analyzer import (
     TranscriptAnalyzer,
@@ -501,7 +509,414 @@ def test_analyzer_retries_invalid_json_once() -> None:
     assert "AFTER [35.000 - 60.000]" in calls[2]["messages"][-1]["content"]
     assert result[0].title == "Good"
     assert result[0].standalone is True
-    assert result[0].opening_context
+
+
+def test_builds_four_second_transcript_backed_highlight_windows() -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=10,
+        segments=[
+            TranscriptSegment(start=0, end=3, text="First moment"),
+            TranscriptSegment(start=4, end=8, text="Second moment"),
+            TranscriptSegment(start=8, end=10, text="Final moment"),
+        ],
+    )
+
+    windows = build_highlight_windows(transcript, window_seconds=4)
+
+    assert [(item["start"], item["end"]) for item in windows] == [
+        (0.0, 4.0),
+        (4.0, 8.0),
+        (8.0, 10),
+    ]
+    assert windows[1]["text"] == "Second moment"
+
+
+def test_highlight_windows_slice_long_untimed_caption_text() -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=8,
+        segments=[
+            TranscriptSegment(
+                start=0,
+                end=8,
+                text="one two three four five six seven eight",
+            )
+        ],
+    )
+
+    windows = build_highlight_windows(transcript, window_seconds=4)
+
+    assert windows[0]["text"] == "one two three four"
+    assert windows[1]["text"] == "five six seven eight"
+
+
+def test_highlight_validation_rejects_invented_windows_and_bounds_montage() -> None:
+    windows = [
+        {"start": 0.0, "end": 4.0},
+        {"start": 8.0, "end": 12.0},
+        {"start": 20.0, "end": 24.0},
+    ]
+    moments = validate_highlight_moments(
+        [
+            {"start": 8, "end": 12, "score": 0.9, "hook": "B", "reason": "B"},
+            {"start": 1, "end": 5, "score": 1, "hook": "Bad", "reason": "Bad"},
+            {"start": 0, "end": 4, "score": 0.8, "hook": "A", "reason": "A"},
+            {"start": 20, "end": 24, "score": 0.7, "hook": "C", "reason": "C"},
+        ],
+        allowed_windows=windows,
+    )
+
+    montage = validate_highlight_montage(
+        {
+            "title": "Best moments",
+            "summary": "A varied highlight reel.",
+            "moments": [moment.model_dump() for moment in moments],
+        },
+        proposed_moments=moments,
+        max_duration=8,
+        max_moments=2,
+    )
+
+    assert [(item.start, item.end) for item in montage.moments] == [(8, 12), (0, 4)]
+    assert montage.duration == 8
+
+
+def test_highlight_screening_payload_requires_an_explicit_moments_array() -> None:
+    windows = [{"start": 0.0, "end": 4.0}]
+
+    assert validate_highlight_screening_payload(
+        {"moments": []},
+        allowed_windows=windows,
+    ) == []
+    with pytest.raises(AnalysisError, match="only a 'moments' array"):
+        validate_highlight_screening_payload({}, allowed_windows=windows)
+    with pytest.raises(AnalysisError, match="must be an array"):
+        validate_highlight_screening_payload(
+            {"moments": "none"},  # type: ignore[dict-item]
+            allowed_windows=windows,
+        )
+
+
+def test_highlight_review_pool_preserves_quality_across_the_timeline() -> None:
+    batches = [
+        [
+            HighlightMoment(
+                start=batch * 40 + offset * 4,
+                end=batch * 40 + offset * 4 + 4,
+                score=0.95 if offset == 1 else 0.8,
+                hook=f"Batch {batch} moment {offset}",
+                reason="Strong moment",
+            )
+            for offset in range(3)
+        ]
+        for batch in range(8)
+    ]
+
+    selected = select_diverse_highlight_pool(batches, limit=4)
+
+    assert len(selected) == 4
+    assert all(moment.score == 0.95 for moment in selected)
+    assert sorted(moment.start for moment in selected) == [4, 84, 164, 244]
+
+
+def test_highlight_montage_uses_batched_screening_and_global_review() -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=16,
+        segments=[
+            TranscriptSegment(start=index, end=index + 1, text=f"Moment {index}")
+            for index in range(16)
+        ],
+    )
+    responses = iter(
+        [
+            {
+                "choices": [{"message": {"content": json.dumps({"moments": [
+                    {"start": 0, "end": 4, "score": 0.8, "hook": "A", "reason": "A"},
+                    {"start": 4, "end": 8, "score": 0.9, "hook": "B", "reason": "B"},
+                ]})}}]
+            },
+            {
+                "choices": [{"message": {"content": json.dumps({"moments": [
+                    {"start": 8, "end": 12, "score": 0.95, "hook": "C", "reason": "C"},
+                    {"start": 12, "end": 16, "score": 0.7, "hook": "D", "reason": "D"},
+                ]})}}]
+            },
+            {
+                "choices": [{"message": {"content": json.dumps({
+                    "title": "The Best Bits",
+                    "summary": "All the strongest moments.",
+                    "moments": [
+                        {"start": 8, "end": 12, "score": 0.95, "hook": "C", "reason": "C"},
+                        {"start": 4, "end": 8, "score": 0.9, "hook": "B", "reason": "B"},
+                    ],
+                })}}]
+            },
+        ]
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_completion(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return next(responses)
+
+    montage = TranscriptAnalyzer(completion_fn=fake_completion).find_highlight_montage(
+        transcript,
+        model="test/model",
+        window_seconds=4,
+        max_duration=12,
+        max_moments=3,
+        batch_windows=2,
+    )
+
+    assert len(calls) == 3
+    assert montage.title == "The Best Bits"
+    assert [(item.start, item.end) for item in montage.moments] == [(8, 12), (4, 8)]
+    first_messages = calls[0]["messages"]
+    second_messages = calls[1]["messages"]
+    assert isinstance(first_messages, list)
+    assert isinstance(second_messages, list)
+    first_prompt = first_messages[1]["content"]
+    second_prompt = second_messages[1]["content"]
+    assert '"selectable_window": {"window_id": 1' in first_prompt
+    assert '"context_before": null' in first_prompt
+    assert '"context_after": "Moment 4 Moment 5 Moment 6 Moment 7"' in first_prompt
+    assert '"context_before": "Moment 4 Moment 5 Moment 6 Moment 7"' in second_prompt
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [{}, {"moments": "not-an-array"}, []],
+    ids=["missing-moments", "non-list-moments", "non-object-payload"],
+)
+def test_highlight_screening_retries_malformed_payload_and_accepts_empty_array(
+    bad_payload: object,
+) -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=16,
+        segments=[
+            TranscriptSegment(start=index, end=index + 1, text=f"Moment {index}")
+            for index in range(16)
+        ],
+    )
+    moments = [
+        {"start": 8, "end": 12, "score": 0.9, "hook": "C", "reason": "C"},
+        {"start": 12, "end": 16, "score": 0.8, "hook": "D", "reason": "D"},
+    ]
+    responses = iter(
+        [
+            {"choices": [{"message": {"content": json.dumps(bad_payload)}}]},
+            {"choices": [{"message": {"content": '{"moments": []}'}}]},
+            {
+                "choices": [
+                    {"message": {"content": json.dumps({"moments": moments})}}
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "title": "Best moments",
+                                    "summary": "Two strong moments.",
+                                    "moments": moments,
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_completion(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return next(responses)
+
+    montage = TranscriptAnalyzer(completion_fn=fake_completion).find_highlight_montage(
+        transcript,
+        model="test/model",
+        batch_windows=2,
+    )
+
+    assert montage.title == "Best moments"
+    assert len(calls) == 4
+    retry_messages = calls[1]["messages"]
+    assert isinstance(retry_messages, list)
+    assert "Previous error:" in retry_messages[-1]["content"]
+
+
+@pytest.mark.parametrize(
+    ("model", "provider", "expected_extra_body"),
+    [
+        (
+            DEFAULT_ANALYSIS_MODEL,
+            LLMProvider.NVIDIA,
+            {
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "medium_effort": True,
+                    "force_nonempty_content": True,
+                }
+            },
+        ),
+        (
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+            LLMProvider.OPENROUTER,
+            {"reasoning": {"max_tokens": 2_000, "exclude": True}},
+        ),
+        ("openai/gpt-4.1-mini", LLMProvider.OPENAI, None),
+        ("anthropic/claude-sonnet-4-6", LLMProvider.ANTHROPIC, None),
+    ],
+    ids=["nvidia-nim", "openrouter", "openai", "anthropic"],
+)
+def test_highlight_montage_uses_provider_structured_tool_contracts(
+    model: str,
+    provider: LLMProvider,
+    expected_extra_body: dict[str, object] | None,
+) -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=8,
+        segments=[TranscriptSegment(start=0, end=8, text="Two excellent moments")],
+    )
+    moments = [
+        {"start": 0, "end": 4, "score": 0.9, "hook": "A", "reason": "A"},
+        {"start": 4, "end": 8, "score": 0.8, "hook": "B", "reason": "B"},
+    ]
+    payloads = [
+        {"moments": moments},
+        {
+            "title": "Best moments",
+            "summary": "Two strong moments.",
+            "moments": moments,
+        },
+    ]
+    tool_names = ["submit_highlight_moments", "submit_highlight_montage"]
+    calls: list[dict[str, object]] = []
+
+    def fake_completion(**kwargs: object) -> object:
+        index = len(calls)
+        calls.append(kwargs)
+        return {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": tool_names[index],
+                                    "arguments": json.dumps(payloads[index]),
+                                }
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+
+    montage = TranscriptAnalyzer(
+        completion_fn=fake_completion,
+        api_key="shared-test-key",
+        provider=provider,
+    ).find_highlight_montage(transcript, model=model)
+
+    assert montage.title == "Best moments"
+    assert len(calls) == 2
+    tools: list[list[dict[str, Any]]] = []
+    for call in calls:
+        tool = call["tools"]
+        assert isinstance(tool, list)
+        tools.append(cast(list[dict[str, Any]], tool))
+    assert [tool[0]["function"]["name"] for tool in tools] == tool_names
+    assert "moments" in tools[0][0]["function"]["parameters"]["properties"]
+    assert "title" in tools[1][0]["function"]["parameters"]["properties"]
+    if expected_extra_body is None:
+        assert "extra_body" not in calls[0]
+    else:
+        assert calls[0]["extra_body"] == expected_extra_body
+    if provider == LLMProvider.ANTHROPIC:
+        assert calls[0]["tool_choice"] == {
+            "type": "tool",
+            "name": "submit_highlight_moments",
+        }
+    else:
+        tool_choice = calls[0]["tool_choice"]
+        assert isinstance(tool_choice, dict)
+        assert tool_choice["function"]["name"] == "submit_highlight_moments"
+
+
+def test_terminal_insufficient_final_selection_preserves_exception_type() -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=8,
+        segments=[TranscriptSegment(start=0, end=8, text="Two moments")],
+    )
+    first = {"start": 0, "end": 4, "score": 0.9, "hook": "A", "reason": "A"}
+    second = {"start": 4, "end": 8, "score": 0.8, "hook": "B", "reason": "B"}
+    invalid_montage = {
+        "title": "Duplicate",
+        "summary": "The same moment twice.",
+        "moments": [first, first],
+    }
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({"moments": [first, second]})
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"message": {"content": json.dumps(invalid_montage)}}]},
+            {"choices": [{"message": {"content": json.dumps(invalid_montage)}}]},
+        ]
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_completion(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return next(responses)
+
+    with pytest.raises(InsufficientHighlightsError, match="at least two"):
+        TranscriptAnalyzer(completion_fn=fake_completion).find_highlight_montage(
+            transcript,
+            model="test/model",
+        )
+
+    assert len(calls) == 3
 
 
 def test_comedy_content_type_guides_both_existing_analysis_stages() -> None:

@@ -56,6 +56,7 @@ def run(
     video_layout: VideoLayout | None = None,
     clip_count: int | None = None,
     content_type: ContentType | str | None = None,
+    highlight_montage: bool | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> PipelineResult:
     """Run one video with values suitable for scripts, tests, or a debugger."""
@@ -71,6 +72,7 @@ def run(
         video_layout is not None
         or clip_count is not None
         or content_type is not None
+        or highlight_montage is not None
     ):
         raise ValueError("Pass either config or individual runner settings, not both.")
     if config is not None:
@@ -83,6 +85,8 @@ def run(
             config_values["clip_count"] = clip_count
         if content_type is not None:
             config_values["content_type"] = content_type
+        if highlight_montage is not None:
+            config_values["highlight_montage"] = highlight_montage
         pipeline_config = PipelineConfig.model_validate(config_values)
     callback = progress_callback if progress_callback is not None else ConsoleProgress()
     return ClipPipeline(
@@ -110,6 +114,12 @@ def print_result(result: PipelineResult) -> None:
             print(f"    Vertical poster: {poster_path}")
     else:
         print("No clips were rendered.")
+    if result.montage_video_path:
+        print("Highlight montage:")
+        print(f"  {result.montage.title if result.montage else 'Best moments'}")
+        print(f"    Video: {result.montage_video_path}")
+        print(f"    Thumbnail: {result.montage_thumbnail_path}")
+        print(f"    Vertical poster: {result.montage_poster_path}")
 
 
 if __name__ == "__main__":

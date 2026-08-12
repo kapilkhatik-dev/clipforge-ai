@@ -16,6 +16,31 @@ from yt_clipper import (
 from yt_clipper.domain.models import TranscriptSegment, VideoMetadata
 
 
+@pytest.fixture(autouse=True)
+def isolate_llm_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep configuration tests independent from a developer's real .env."""
+    for variable_name in (
+        "CLIPPER_LLM_PROVIDER",
+        "CLIPPER_LLM_MODEL",
+        "CLIPPER_LLM_API_KEY",
+        "CLIPPER_CODEX_MODEL",
+        "CLIPPER_NVIDIA_MODEL",
+        "CLIPPER_OPENROUTER_MODEL",
+        "CLIPPER_OPENAI_MODEL",
+        "CLIPPER_ANTHROPIC_MODEL",
+        "CLIPPER_MODEL",
+        "CLIPPER_CONTENT_TYPE",
+        "CLIPPER_CODEX_BINARY",
+        "CLIPPER_CODEX_TIMEOUT_SECONDS",
+        "NVIDIA_NIM_API_KEY",
+        "NVIDIA_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(variable_name, raising=False)
+
+
 def test_uses_nvidia_nim_model_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

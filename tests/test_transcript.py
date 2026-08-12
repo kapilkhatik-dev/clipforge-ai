@@ -238,6 +238,55 @@ def test_local_video_uses_matching_automatic_sidecar_captions(
     assert transcript_path.is_file()
 
 
+def test_editing_local_sidecar_invalidates_cached_transcript(
+    tmp_path: Path,
+) -> None:
+    local_source = tmp_path / "Local.mp4"
+    local_source.write_bytes(b"original-local-video")
+    sidecar = tmp_path / "Local.en.srt"
+    sidecar.write_text(
+        "1\n00:00:01,000 --> 00:00:04,000\nFirst caption.\n",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "output" / "local-video"
+    work_dir.mkdir(parents=True)
+    staged_source = work_dir / "source.mp4"
+    staged_source.write_bytes(local_source.read_bytes())
+    video = DownloadedVideo(
+        metadata=VideoMetadata(
+            video_id="local-video",
+            source_url=str(local_source),
+            title="Local",
+            duration_seconds=10,
+        ),
+        video_path=staged_source,
+        metadata_path=work_dir / "metadata.json",
+        work_dir=work_dir,
+    )
+    service = TranscriptService(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+
+    first, _ = service.get_transcript(
+        video,
+        language="en",
+        mode=TranscriptMode.CAPTIONS,
+    )
+    sidecar.write_text(
+        "1\n00:00:01,000 --> 00:00:04,000\nUpdated caption text.\n",
+        encoding="utf-8",
+    )
+    second, _ = service.get_transcript(
+        video,
+        language="en",
+        mode=TranscriptMode.CAPTIONS,
+    )
+
+    assert first.segments[0].text == "First caption."
+    assert second.segments[0].text == "Updated caption text."
+    assert first.source_fingerprint != second.source_fingerprint
+
+
 def test_whisper_lock_covers_pcm_extraction_and_transcription(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

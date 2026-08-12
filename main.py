@@ -1,4 +1,4 @@
-"""Debugger-friendly development runner for the YouTube clipper pipeline.
+"""Debugger-friendly development runner for the video clipper pipeline.
 
 Set CLIPPER_VIDEO_URL in .env, place breakpoints anywhere in ``yt_clipper``,
 and launch the "Debug YouTube Clipper" target in Zed. Future frontends should
@@ -121,6 +121,5 @@ if __name__ == "__main__":
         run(
             video_url="https://www.youtube.com/watch?v=aSR1tndcaLE",
             video_layout=VideoLayout.FILL_CROP,
-            content_type="comedy"
         )
     )

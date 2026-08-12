@@ -78,7 +78,7 @@ These are all user-configurable environment variables read by the application
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `CLIPPER_VIDEO_URL` | For `main.py` when no URL argument is supplied | Input YouTube URL |
+| `CLIPPER_VIDEO_URL` | For `main.py` when no input argument is supplied | Input YouTube URL or supported local video path |
 | `CLIPPER_CONTENT_TYPE` | No; defaults to `auto` | Editorial genre used to rank clips; set `comedy` to prioritize complete jokes and punchlines |
 | `CLIPPER_LLM_PROVIDER` | No; defaults to `nvidia` | Active AI backend |
 | `CLIPPER_LLM_MODEL` | No | Common active-provider model override; highest environment precedence |

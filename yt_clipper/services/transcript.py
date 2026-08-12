@@ -271,6 +271,39 @@ def _whisper_options_fingerprint(
     )
 
 
+def _local_caption_candidates(source_path: Path, language: str) -> list[Path]:
+    """Return matching sidecars in deterministic language-preference order."""
+    source_stem = source_path.stem.casefold()
+    candidates = [
+        path
+        for path in sorted(
+            source_path.parent.iterdir(),
+            key=lambda item: item.name.casefold(),
+        )
+        if path.is_file()
+        and path.suffix.casefold() in _LOCAL_CAPTION_EXTENSIONS
+        and (
+            path.stem.casefold() == source_stem
+            or path.name.casefold().startswith(f"{source_stem}.")
+        )
+    ]
+
+    requested = language.casefold()
+    if requested != "auto":
+        requested_base = requested.split("-")[0]
+        candidates.sort(
+            key=lambda path: (
+                0
+                if f".{requested}." in path.name.casefold()
+                else 1
+                if f".{requested_base}-" in path.name.casefold()
+                else 2,
+                path.name.casefold(),
+            )
+        )
+    return candidates
+
+
 class TranscriptService:
     def __init__(self, media_tools: MediaTools) -> None:
         self._media_tools = media_tools
@@ -292,10 +325,28 @@ class TranscriptService:
         progress_callback: TranscriptProgressCallback | None = None,
     ) -> tuple[TranscriptDocument, Path]:
         cache_path = video.work_dir / "transcript.json"
+        local_source = resolve_local_video_path(video.metadata.source_url)
         try:
-            source_fingerprint = fingerprint_file(video.video_path)
+            video_fingerprint = fingerprint_file(video.video_path)
+            if local_source is None or mode == TranscriptMode.WHISPER:
+                source_fingerprint = video_fingerprint
+            else:
+                source_fingerprint = fingerprint_payload(
+                    {
+                        "video": video_fingerprint,
+                        "caption_sidecars": [
+                            {
+                                "name": path.name,
+                                "fingerprint": fingerprint_file(path),
+                            }
+                            for path in _local_caption_candidates(local_source, language)
+                        ],
+                    }
+                )
         except OSError as exc:
-            raise TranscriptError(f"Could not fingerprint source video: {exc}") from exc
+            raise TranscriptError(
+                f"Could not fingerprint local transcript inputs: {exc}"
+            ) from exc
         whisper_fingerprint = _whisper_options_fingerprint(
             whisper_model,
             whisper_device,
@@ -323,7 +374,6 @@ class TranscriptService:
                 LOGGER.warning("Ignoring invalid transcript cache at %s", cache_path)
 
         transcript: TranscriptDocument | None = None
-        local_source = resolve_local_video_path(video.metadata.source_url)
         if mode in {TranscriptMode.AUTO, TranscriptMode.CAPTIONS}:
             try:
                 transcript = (
@@ -379,36 +429,7 @@ class TranscriptService:
         language: str,
         source_fingerprint: str,
     ) -> TranscriptDocument | None:
-        source_stem = source_path.stem.casefold()
-        candidates = [
-            path
-            for path in sorted(
-                source_path.parent.iterdir(),
-                key=lambda item: item.name.casefold(),
-            )
-            if path.is_file()
-            and path.suffix.casefold() in _LOCAL_CAPTION_EXTENSIONS
-            and (
-                path.stem.casefold() == source_stem
-                or path.name.casefold().startswith(f"{source_stem}.")
-            )
-        ]
-
-        requested = language.casefold()
-        if requested != "auto":
-            requested_base = requested.split("-")[0]
-            candidates.sort(
-                key=lambda path: (
-                    0
-                    if f".{requested}." in path.name.casefold()
-                    else 1
-                    if f".{requested_base}-" in path.name.casefold()
-                    else 2,
-                    path.name.casefold(),
-                )
-            )
-
-        for caption_path in candidates:
+        for caption_path in _local_caption_candidates(source_path, language):
             try:
                 if caption_path.stat().st_size > _MAX_CAPTION_RESPONSE_BYTES:
                     continue

@@ -427,7 +427,17 @@ class VideoDownloader:
                     temporary_path.unlink(missing_ok=True)
 
             try:
+                if video_path.stat().st_size > maximum_download_bytes:
+                    video_path.unlink(missing_ok=True)
+                    raise DownloadError(
+                        "Staged local video exceeds the configured source-size limit."
+                    )
                 staged_probe = probe_media(self._media_tools, video_path)
+            except OSError as exc:
+                video_path.unlink(missing_ok=True)
+                raise DownloadError(
+                    f"Could not inspect staged local video size: {exc}"
+                ) from exc
             except MediaProbeError as exc:
                 video_path.unlink(missing_ok=True)
                 raise DownloadError(f"Local media failed validation: {exc}") from exc

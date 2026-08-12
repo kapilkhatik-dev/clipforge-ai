@@ -75,6 +75,34 @@ def test_inspects_and_stages_local_mp4_without_ytdlp(
     assert staged.metadata_path.is_file()
 
 
+def test_rejects_local_remux_that_exceeds_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "Local.mkv"
+    source.write_bytes(b"tiny")
+    probe = MediaProbe(duration_seconds=60, has_video=True, has_audio=True)
+    monkeypatch.setattr(downloader_module, "probe_media", lambda *_args: probe)
+
+    def fake_run(command: list[str], **_kwargs: object) -> None:
+        Path(command[-1]).write_bytes(b"remux-too-large")
+
+    monkeypatch.setattr(downloader_module.subprocess, "run", fake_run)
+    downloader = VideoDownloader(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+    metadata = downloader.inspect(str(source))
+
+    with pytest.raises(DownloadError, match="Staged local video exceeds"):
+        downloader.download(
+            metadata,
+            tmp_path / "output",
+            maximum_download_bytes=8,
+        )
+
+    assert not (tmp_path / "output" / metadata.video_id / "source.mp4").exists()
+
+
 def test_download_filter_rejects_changed_over_limit_video_before_media_transfer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

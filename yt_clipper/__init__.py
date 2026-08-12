@@ -20,6 +20,8 @@ from .domain.errors import (
 )
 from .domain.models import (
     ClipCandidate,
+    HighlightMoment,
+    HighlightMontage,
     PipelineConfig,
     PipelineEvent,
     PipelineResult,
@@ -40,6 +42,8 @@ __all__ = [
     "ClipPipeline",
     "ClipperError",
     "ContentType",
+    "HighlightMoment",
+    "HighlightMontage",
     "DependencyError",
     "DownloadError",
     "DurationLimitError",

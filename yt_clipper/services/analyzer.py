@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -26,6 +27,8 @@ from ..domain.models import (
     MAX_CLIP_COUNT,
     MAX_CLIP_DURATION_SECONDS,
     ClipCandidate,
+    HighlightMoment,
+    HighlightMontage,
     TranscriptDocument,
     TranscriptSegment,
 )
@@ -34,6 +37,7 @@ from .codex_cli import CodexCLIClient, CodexCLIError
 
 CompletionFunction = Callable[..., Any]
 CandidateValidator = Callable[[Sequence[Any]], list[ClipCandidate]]
+StructuredValidator = Callable[[dict[str, Any] | list[Any]], Any]
 AnalysisChunkProgressCallback = Callable[[int, int], None]
 
 LOGGER = logging.getLogger(__name__)
@@ -357,6 +361,132 @@ def _candidate_items(payload: dict[str, Any] | list[Any]) -> list[Any]:
         if isinstance(value, list):
             return value
     raise AnalysisError("The model JSON must contain a 'clips' array.")
+
+
+def build_highlight_windows(
+    transcript: TranscriptDocument,
+    window_seconds: float = 4.0,
+) -> list[dict[str, Any]]:
+    """Build transcript-backed fixed windows without decoding the video."""
+    windows: list[dict[str, Any]] = []
+    start = 0.0
+    index = 1
+    while start < transcript.duration_seconds - 0.01:
+        end = min(transcript.duration_seconds, start + window_seconds)
+        text_parts: list[str] = []
+        for segment in transcript.segments:
+            if segment.start >= end or segment.end <= start:
+                continue
+            if segment.words:
+                text = " ".join(
+                    word.text
+                    for word in segment.words
+                    if word.start < end and word.end > start
+                ).strip()
+            elif start <= segment.start and segment.end <= end:
+                text = segment.text
+            else:
+                words = segment.text.split()
+                visible_start = max(start, segment.start)
+                visible_end = min(end, segment.end)
+                first = math.floor(
+                    (visible_start - segment.start)
+                    / (segment.end - segment.start)
+                    * len(words)
+                )
+                last = math.ceil(
+                    (visible_end - segment.start)
+                    / (segment.end - segment.start)
+                    * len(words)
+                )
+                text = " ".join(
+                    words[max(0, first) : min(len(words), max(first + 1, last))]
+                )
+            if text:
+                text_parts.append(text)
+        text = " ".join(text_parts).strip()
+        if text:
+            windows.append(
+                {
+                    "window_id": index,
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "text": text,
+                }
+            )
+        start = end
+        index += 1
+    return windows
+
+
+def validate_highlight_moments(
+    items: Sequence[Any],
+    *,
+    allowed_windows: Sequence[dict[str, Any]],
+) -> list[HighlightMoment]:
+    """Accept only exact windows supplied to the model and remove duplicates."""
+    allowed = {
+        (round(float(window["start"]), 3), round(float(window["end"]), 3))
+        for window in allowed_windows
+    }
+    retained: dict[tuple[float, float], HighlightMoment] = {}
+    messages: list[str] = []
+    for index, item in enumerate(items):
+        try:
+            moment = HighlightMoment.model_validate(item)
+        except ValidationError as exc:
+            messages.append(f"moment {index + 1}: {exc.errors()[0]['msg']}")
+            continue
+        key = (round(moment.start, 3), round(moment.end, 3))
+        if key not in allowed:
+            messages.append(f"moment {index + 1}: timestamps do not match a supplied window")
+            continue
+        previous = retained.get(key)
+        if previous is None or moment.score > previous.score:
+            retained[key] = moment
+    if not retained:
+        details = "; ".join(messages[:5]) or "no moments were provided"
+        raise AnalysisError(f"The model returned no usable highlight moments: {details}")
+    return sorted(retained.values(), key=lambda item: (-item.score, item.start))
+
+
+def validate_highlight_montage(
+    payload: dict[str, Any] | list[Any],
+    *,
+    proposed_moments: Sequence[HighlightMoment],
+    max_duration: float,
+    max_moments: int,
+) -> HighlightMontage:
+    if not isinstance(payload, dict):
+        raise AnalysisError("The montage response must be a JSON object.")
+    try:
+        montage = HighlightMontage.model_validate(payload)
+    except ValidationError as exc:
+        raise AnalysisError(
+            f"The model returned an invalid highlight montage: {exc.errors()[0]['msg']}"
+        ) from exc
+    allowed = {
+        (round(moment.start, 3), round(moment.end, 3)): moment
+        for moment in proposed_moments
+    }
+    selected: list[HighlightMoment] = []
+    seen: set[tuple[float, float]] = set()
+    total = 0.0
+    for moment in montage.moments:
+        key = (round(moment.start, 3), round(moment.end, 3))
+        source = allowed.get(key)
+        if source is None:
+            raise AnalysisError("The montage selected a moment outside the proposed pool.")
+        if key in seen:
+            continue
+        if len(selected) >= max_moments or total + source.duration > max_duration + 0.01:
+            continue
+        selected.append(source)
+        seen.add(key)
+        total += source.duration
+    if len(selected) < 2:
+        raise AnalysisError("The montage must contain at least two approved moments.")
+    return montage.model_copy(update={"moments": selected})
 
 
 def validate_clip_candidates(
@@ -905,6 +1035,219 @@ class TranscriptAnalyzer:
         if clip_count is None:
             return final_candidates
         return final_candidates[:clip_count]
+
+    def find_highlight_montage(
+        self,
+        transcript: TranscriptDocument,
+        model: str,
+        *,
+        content_type: ContentType | str = ContentType.AUTO,
+        window_seconds: float = 4.0,
+        max_duration: float = 60.0,
+        max_moments: int = 12,
+        batch_windows: int = 60,
+        request_max_attempts: int = 3,
+        progress_callback: AnalysisChunkProgressCallback | None = None,
+    ) -> HighlightMontage:
+        """Select short moments in batches, then edit the best into one montage."""
+        resolved_content_type, editorial_guidance = _content_type_guidance(content_type)
+        windows = build_highlight_windows(transcript, window_seconds)
+        if len(windows) < 2:
+            raise AnalysisError(
+                "The transcript does not contain enough populated highlight windows."
+            )
+        batches = [
+            windows[index : index + batch_windows]
+            for index in range(0, len(windows), batch_windows)
+        ]
+        moment_schema = {
+            "type": "object",
+            "properties": {
+                "moments": {
+                    "type": "array",
+                    "maxItems": min(20, batch_windows),
+                    "items": HighlightMoment.model_json_schema(),
+                }
+            },
+            "required": ["moments"],
+            "additionalProperties": False,
+        }
+        proposed: list[HighlightMoment] = []
+        for batch_index, batch in enumerate(batches, start=1):
+            window_text = "\n".join(json.dumps(window) for window in batch)
+            prompt = f"""You are screening fixed short windows from a video transcript.
+
+Content-type focus ({resolved_content_type.value}):
+{editorial_guidance}
+
+Return a JSON object with a \"moments\" array. Select only windows that contain a
+genuinely interesting, funny, surprising, impressive, emotional, quotable, or
+visually promising beat. Skip weak, repetitive, transitional, incomplete, or
+contextless windows. Never change or combine timestamps: each returned start/end
+must exactly match one supplied window. Score each selected moment from 0 to 1 and
+briefly state its hook and selection reason. An empty moments array is correct when
+the batch contains nothing strong.
+
+WINDOWS:
+{window_text}
+"""
+            result = self._request_structured_json(
+                prompt=prompt,
+                system_message=(
+                    "Act as a strict short-form highlight screener. Keep only exact "
+                    "supplied windows and return strict JSON."
+                ),
+                model=model,
+                output_schema=moment_schema,
+                description="Submit the strongest exact highlight windows from this batch.",
+                validator=lambda payload, allowed=batch: validate_highlight_moments(
+                    payload.get("moments", []) if isinstance(payload, dict) else [],
+                    allowed_windows=allowed,
+                )
+                if isinstance(payload, dict) and payload.get("moments")
+                else [],
+                temperature=0.1,
+                request_max_attempts=request_max_attempts,
+            )
+            proposed.extend(result)
+            if progress_callback:
+                progress_callback(batch_index, len(batches) + 1)
+
+        unique = {
+            (round(moment.start, 3), round(moment.end, 3)): moment
+            for moment in sorted(proposed, key=lambda item: item.score)
+        }
+        review_pool = sorted(
+            unique.values(),
+            key=lambda item: (-item.score, item.start),
+        )[: min(60, max(20, max_moments * 4))]
+        if len(review_pool) < 2:
+            raise AnalysisError(
+                "Fewer than two short windows were strong enough for a montage."
+            )
+
+        candidate_text = "\n".join(
+            moment.model_dump_json() for moment in review_pool
+        )
+        montage_schema = HighlightMontage.model_json_schema()
+        final_prompt = f"""You are the final editor for a single short highlight montage.
+
+Content-type focus ({resolved_content_type.value}):
+{editorial_guidance}
+
+Choose the best moments across the entire video from the approved pool below.
+Create one highly engaging montage no longer than {max_duration:.1f} seconds and
+containing at most {max_moments} moments. Use at least two moments. Preserve each
+moment's exact timestamps and evidence. Order moments for the strongest viewing
+experience, balancing variety, pacing, coherence, and a powerful opening/ending.
+Avoid redundant moments even when both scored highly. Generate one concise,
+relevant title and a short summary for the combined video. Return only JSON matching
+the schema.
+
+APPROVED MOMENT POOL:
+{candidate_text}
+"""
+        montage = self._request_structured_json(
+            prompt=final_prompt,
+            system_message=(
+                "Act as a decisive whole-video montage editor. Select only from the "
+                "approved moment pool and return strict JSON."
+            ),
+            model=model,
+            output_schema=montage_schema,
+            description="Submit one title, summary, and ordered whole-video montage.",
+            validator=lambda payload: validate_highlight_montage(
+                payload,
+                proposed_moments=review_pool,
+                max_duration=max_duration,
+                max_moments=max_moments,
+            ),
+            temperature=0.1,
+            request_max_attempts=request_max_attempts,
+        )
+        if progress_callback:
+            progress_callback(len(batches) + 1, len(batches) + 1)
+        return montage
+
+    def _request_structured_json(
+        self,
+        *,
+        prompt: str,
+        system_message: str,
+        model: str,
+        output_schema: dict[str, Any],
+        description: str,
+        validator: StructuredValidator,
+        temperature: float,
+        request_max_attempts: int,
+    ) -> Any:
+        last_error: AnalysisError | None = None
+        previous_content: str | None = None
+        for attempt in range(2):
+            messages: list[dict[str, str]] = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ]
+            if attempt:
+                if previous_content:
+                    messages.append({"role": "assistant", "content": previous_content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Return corrected JSON now. Follow the schema and use only "
+                            f"allowed timestamps. Previous error: {last_error}"
+                        ),
+                    }
+                )
+            response_content: str | None = None
+            finish_reason: str | None = None
+            try:
+                if self._provider == LLMProvider.CODEX:
+                    if self._codex_client is None:
+                        raise CodexCLIError(
+                            "The Codex CLI analysis client is unavailable."
+                        )
+                    result = self._codex_client.request(
+                        messages=messages,
+                        model=model,
+                        output_schema=output_schema,
+                        description=description,
+                        max_attempts=request_max_attempts,
+                    )
+                    return validator(result.payload)
+
+                request_options: dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "timeout": 120,
+                    "max_tokens": _MAX_ANALYSIS_OUTPUT_TOKENS,
+                    "max_retries": max(0, request_max_attempts - 1),
+                }
+                if self._api_key is not None:
+                    request_options["api_key"] = self._api_key
+                response = self._completion(**request_options)
+                finish_reason = _response_finish_reason(response)
+                response_content = _response_content(response)
+                return validator(extract_json_payload(response_content))
+            except AnalysisError as exc:
+                previous_content = response_content
+                last_error = (
+                    AnalysisError("The model hit the completion-token limit.")
+                    if finish_reason in {"length", "max_tokens"}
+                    else exc
+                )
+            except CodexCLIError as exc:
+                raise AnalysisError(f"Codex CLI analysis failed: {exc}") from exc
+            except Exception as exc:
+                raise AnalysisError(
+                    f"LiteLLM montage request failed for model '{model}': {exc}. "
+                    "Check the active provider model and credentials."
+                ) from exc
+        raise AnalysisError(
+            f"The model returned invalid montage data twice: {last_error}"
+        )
 
     def _analyze_chunks(
         self,

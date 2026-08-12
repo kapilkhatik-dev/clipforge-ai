@@ -26,6 +26,7 @@ from ..config import (
     resolve_codex_binary,
     resolve_codex_timeout_seconds,
     resolve_content_type,
+    resolve_highlight_montage,
     resolve_llm_api_key,
     resolve_llm_provider,
 )
@@ -114,6 +115,14 @@ class PipelineConfig(StrictModel):
         default_factory=resolve_content_type,
         validate_default=True,
     )
+    highlight_montage: bool = Field(
+        default_factory=resolve_highlight_montage,
+        validate_default=True,
+    )
+    highlight_window_seconds: float = Field(default=4.0, ge=3.0, le=6.0)
+    highlight_montage_max_duration: float = Field(default=60.0, ge=12.0, le=60.0)
+    highlight_montage_max_moments: int = Field(default=12, ge=2, le=20)
+    highlight_analysis_batch_windows: int = Field(default=60, ge=10, le=100)
     min_clip_duration: float = Field(
         default=20.0,
         ge=5.0,
@@ -205,6 +214,10 @@ class PipelineConfig(StrictModel):
         if self.whisper_chunk_overlap_seconds * 2 >= self.whisper_chunk_seconds:
             raise ValueError(
                 "whisper_chunk_overlap_seconds must be less than half the chunk size"
+            )
+        if self.highlight_montage_max_duration < self.highlight_window_seconds * 2:
+            raise ValueError(
+                "highlight_montage_max_duration must fit at least two highlight windows"
             )
         return self
 
@@ -309,6 +322,34 @@ class ClipCandidate(StrictModel):
         return self.end - self.start
 
 
+class HighlightMoment(StrictModel):
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    score: float = Field(ge=0, le=1)
+    hook: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_times(self) -> "HighlightMoment":
+        if self.end <= self.start:
+            raise ValueError("highlight moment end must be greater than start")
+        return self
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
+class HighlightMontage(StrictModel):
+    title: str = Field(min_length=1, max_length=120)
+    summary: str = Field(min_length=1, max_length=500)
+    moments: list[HighlightMoment] = Field(min_length=2, max_length=20)
+
+    @property
+    def duration(self) -> float:
+        return sum(moment.duration for moment in self.moments)
+
+
 class AnalysisDocument(StrictModel):
     schema_version: int = Field(ge=1)
     video_id: str
@@ -324,6 +365,21 @@ class AnalysisDocument(StrictModel):
     transcript_origin: TranscriptOrigin
     transcript_sha256: str = Field(min_length=64, max_length=64)
     candidates: list[ClipCandidate]
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class MontageAnalysisDocument(StrictModel):
+    schema_version: int = Field(ge=1)
+    video_id: str
+    model: str
+    analysis_backend: str = Field(min_length=1)
+    content_type: ContentType
+    window_seconds: float
+    max_duration: float
+    max_moments: int
+    batch_windows: int
+    transcript_sha256: str = Field(min_length=64, max_length=64)
+    montage: HighlightMontage
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -347,3 +403,8 @@ class PipelineResult(StrictModel):
     clip_paths: list[Path] = Field(default_factory=list)
     thumbnail_paths: list[Path] = Field(default_factory=list)
     poster_paths: list[Path] = Field(default_factory=list)
+    montage: HighlightMontage | None = None
+    montage_analysis_path: Path | None = None
+    montage_video_path: Path | None = None
+    montage_thumbnail_path: Path | None = None
+    montage_poster_path: Path | None = None

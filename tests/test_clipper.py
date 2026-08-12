@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-from yt_clipper.domain.models import TranscriptSegment, TranscriptWord, VideoLayout
+from yt_clipper.domain.models import (
+    HighlightMoment,
+    TranscriptSegment,
+    TranscriptWord,
+    VideoLayout,
+)
 from yt_clipper.services.renderer import (
     build_ass_document,
     build_caption_cues,
     build_thumbnail_ass_document,
     build_thumbnail_filter_graph,
+    build_montage_filter_graph,
     build_vertical_poster_ass_document,
     build_vertical_poster_filter_graph,
     build_video_filter_graph,
     clip_transcript_segments,
+    montage_transcript_segments,
     slugify,
 )
 
@@ -178,3 +185,40 @@ def test_fit_blur_layout_preserves_existing_composition() -> None:
     assert "force_original_aspect_ratio=decrease" in graph
     assert "overlay=(W-w)/2:(H-h)/2" in graph
     assert graph.count("subtitles=") == 1
+
+
+def test_montage_transcript_rebases_captions_across_non_contiguous_cuts() -> None:
+    segments = [
+        TranscriptSegment(start=0, end=4, text="First"),
+        TranscriptSegment(start=12, end=16, text="Second"),
+    ]
+    moments = [
+        HighlightMoment(start=12, end=16, score=0.9, hook="B", reason="B"),
+        HighlightMoment(start=0, end=4, score=0.8, hook="A", reason="A"),
+    ]
+
+    rebased = montage_transcript_segments(segments, moments)
+
+    assert [(item.start, item.end, item.text) for item in rebased] == [
+        (0, 4, "Second"),
+        (4, 8, "First"),
+    ]
+
+
+def test_montage_filter_trims_exact_windows_and_concatenates_audio_video() -> None:
+    moments = [
+        HighlightMoment(start=8, end=12, score=0.9, hook="B", reason="B"),
+        HighlightMoment(start=0, end=4, score=0.8, hook="A", reason="A"),
+    ]
+
+    graph = build_montage_filter_graph(
+        moments,
+        VideoLayout.FILL_CROP,
+        1080,
+        1920,
+    )
+
+    assert "trim=start=8.000:end=12.000" in graph
+    assert "atrim=start=0.000:end=4.000" in graph
+    assert "[v0][a0][v1][a1]concat=n=2:v=1:a=1" in graph
+    assert graph.count("subtitles=filename='captions.ass'") == 1

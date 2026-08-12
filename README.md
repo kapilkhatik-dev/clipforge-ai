@@ -80,6 +80,7 @@ These are all user-configurable environment variables read by the application
 | --- | --- | --- |
 | `CLIPPER_VIDEO_URL` | For `main.py` when no input argument is supplied | Input YouTube URL or supported local video path |
 | `CLIPPER_CONTENT_TYPE` | No; defaults to `auto` | Editorial genre used to rank clips; set `comedy` to prioritize complete jokes and punchlines |
+| `CLIPPER_HIGHLIGHT_MONTAGE` | No; defaults to `false` | Generate one additional video combining AI-selected short moments from across the source |
 | `CLIPPER_LLM_PROVIDER` | No; defaults to `nvidia` | Active AI backend |
 | `CLIPPER_LLM_MODEL` | No | Common active-provider model override; highest environment precedence |
 | `CLIPPER_CODEX_MODEL` | No | Codex model, such as `codex/default` or `codex/gpt-5.6-sol` |
@@ -311,6 +312,39 @@ The development runner also accepts a direct override:
 result = run(video_url, content_type="comedy")
 ```
 
+## Whole-video highlight montage
+
+Set `CLIPPER_HIGHLIGHT_MONTAGE=true` to keep the existing continuous clips and also
+generate one extra montage from the best moments across the complete video. This is
+opt-in, so enabling or disabling it does not change the current clip-selection or
+provider paths.
+
+The montage workflow divides the timestamped transcript into exact 4-second windows
+(configurable from 3–6 seconds), sends those windows to the active Codex or API
+provider in bounded batches, skips weak windows, and performs a final whole-video
+editorial pass over the strongest results. The final pass generates a title and
+orders a varied set of moments into one video of at most 60 seconds. FFmpeg trims
+the exact source ranges, concatenates their audio and video, and rebases captions so
+they remain synchronized after every cut.
+
+```python
+from yt_clipper import PipelineConfig
+
+config = PipelineConfig(
+    highlight_montage=True,
+    highlight_window_seconds=4,
+    highlight_montage_max_duration=60,
+    highlight_montage_max_moments=12,
+    highlight_analysis_batch_windows=60,
+)
+```
+
+The result exposes `montage`, `montage_analysis_path`, `montage_video_path`,
+`montage_thumbnail_path`, and `montage_poster_path`. Generated artifacts are stored
+under `<video-id>/montage/`. The montage analysis cache is independent from normal
+`candidates.json`, and both Codex CLI and OpenRouter use the same provider-neutral
+workflow.
+
 ## Clip count and duration settings
 
 Current defaults are:
@@ -359,6 +393,11 @@ All long-video controls are typed `PipelineConfig` fields, so a future frontend 
 | --- | ---: | --- |
 | `clip_count` | `None` | Automatic: export every approved candidate up to 20; otherwise an integer from 1–20 is the output ceiling |
 | `content_type` | `ContentType.AUTO` | Genre-specific ranking; supports the values documented in [Content-aware clip selection](#content-aware-clip-selection) |
+| `highlight_montage` | `False` | Adds one whole-video montage while preserving all ordinary clip exports |
+| `highlight_window_seconds` | `4.0` | Fixed relevance-screening window from 3–6 seconds |
+| `highlight_montage_max_duration` | `60.0` | Combined montage duration from 12–60 seconds |
+| `highlight_montage_max_moments` | `12` | Maximum selected windows from 2–20 |
+| `highlight_analysis_batch_windows` | `60` | Short windows per screening request from 10–100 |
 | `max_source_duration_seconds` | `3600` | 60–3,600; lowers but cannot exceed the one-hour ceiling |
 | `max_source_download_bytes` | `4 * 1024**3` | 256 MiB–16 GiB; checked by yt-dlp, aggregate stream progress, and final source validation |
 | `whisper_device` | `WhisperDevice.AUTO` | `auto`, `cpu`, or `cuda` |

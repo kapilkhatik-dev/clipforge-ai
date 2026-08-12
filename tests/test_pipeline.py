@@ -10,6 +10,8 @@ from yt_clipper import ClipPipeline, ContentType, PipelineConfig, WhisperDevice
 from yt_clipper.domain.models import (
     ClipCandidate,
     DownloadedVideo,
+    HighlightMoment,
+    HighlightMontage,
     TranscriptDocument,
     TranscriptMode,
     TranscriptOrigin,
@@ -335,3 +337,114 @@ def test_pipeline_renders_every_candidate_in_automatic_mode(
         tmp_path / metadata.video_id / "clips" / f"{index:02d}.poster.jpg"
         for index in range(1, 4)
     ]
+
+
+def test_pipeline_generates_opt_in_whole_video_highlight_montage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    metadata = VideoMetadata(
+        video_id="abcdefghijk",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Montage test",
+        duration_seconds=60,
+    )
+    work_dir = tmp_path / metadata.video_id
+    video = DownloadedVideo(
+        metadata=metadata,
+        video_path=work_dir / "source.mp4",
+        metadata_path=work_dir / "metadata.json",
+        work_dir=work_dir,
+    )
+    transcript = TranscriptDocument(
+        video_id=metadata.video_id,
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=60,
+        segments=[TranscriptSegment(start=0, end=60, text="All moments")],
+    )
+    candidate = ClipCandidate(
+        title="Continuous",
+        start=0,
+        end=60,
+        score=0.9,
+        hook="Hook",
+        reason="Reason",
+        standalone=True,
+        topic="Topic",
+        opening_context="Opening",
+        closing_resolution="Closing",
+    )
+    montage = HighlightMontage(
+        title="Best of everything",
+        summary="The strongest moments.",
+        moments=[
+            HighlightMoment(start=0, end=4, score=0.9, hook="A", reason="A"),
+            HighlightMoment(start=20, end=24, score=0.8, hook="B", reason="B"),
+        ],
+    )
+    observed: dict[str, object] = {}
+
+    class FakeDownloader:
+        def inspect(self, _url: str, **_settings: object) -> VideoMetadata:
+            return metadata
+
+        def download(self, _metadata: VideoMetadata, **_settings: object) -> DownloadedVideo:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            return video
+
+    class FakeTranscriptService:
+        def get_transcript(
+            self, _video: DownloadedVideo, **_settings: object
+        ) -> tuple[TranscriptDocument, Path]:
+            return transcript, work_dir / "transcript.json"
+
+    class FakeAnalyzer:
+        def find_clips(self, **_settings: object) -> list[ClipCandidate]:
+            return [candidate]
+
+        def find_highlight_montage(self, **settings: object) -> HighlightMontage:
+            observed["montage_analysis"] = settings
+            return montage
+
+    class FakeRenderer:
+        def render(self, *, output_dir: Path, **_settings: object) -> Path:
+            return output_dir / "01-continuous.mp4"
+
+        def render_montage(self, *, output_dir: Path, **settings: object) -> Path:
+            observed["montage_render"] = settings
+            return output_dir / "highlight-montage-best.mp4"
+
+        def cleanup_stale(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(pipeline_module, "validate_media_tools", lambda _tools: None)
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_ffmpeg_capabilities",
+        lambda _tools: None,
+    )
+    pipeline = ClipPipeline(
+        PipelineConfig(output_dir=tmp_path, highlight_montage=True),
+        media_tools=MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe")),
+        downloader=FakeDownloader(),  # pyright: ignore[reportArgumentType]
+        transcript_service=FakeTranscriptService(),  # pyright: ignore[reportArgumentType]
+        analyzer=FakeAnalyzer(),  # pyright: ignore[reportArgumentType]
+        renderer=FakeRenderer(),  # pyright: ignore[reportArgumentType]
+    )
+
+    result = pipeline.run(metadata.source_url)
+
+    analysis_settings = observed["montage_analysis"]
+    assert isinstance(analysis_settings, dict)
+    assert analysis_settings["window_seconds"] == 4
+    assert analysis_settings["max_duration"] == 60
+    assert result.montage == montage
+    assert result.montage_analysis_path == work_dir / "montage.json"
+    assert result.montage_analysis_path.is_file()
+    assert result.montage_video_path == work_dir / "montage" / "highlight-montage-best.mp4"
+    assert result.montage_thumbnail_path == result.montage_video_path.with_suffix(
+        ".thumbnail.jpg"
+    )

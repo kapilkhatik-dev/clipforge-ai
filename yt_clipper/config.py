@@ -116,6 +116,18 @@ def resolve_content_type() -> ContentType:
     return normalize_content_type(configured)
 
 
+def resolve_highlight_montage() -> bool:
+    """Return whether whole-video short-window montage generation is enabled."""
+    configured = os.getenv("CLIPPER_HIGHLIGHT_MONTAGE", "false").strip().casefold()
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    if configured in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(
+        "CLIPPER_HIGHLIGHT_MONTAGE must be true/false, yes/no, on/off, or 1/0."
+    )
+
+
 def default_analysis_model(provider: LLMProvider | str) -> str:
     """Return the provider-qualified default model for a supported provider."""
     return _DEFAULT_ANALYSIS_MODELS[normalize_llm_provider(provider)]

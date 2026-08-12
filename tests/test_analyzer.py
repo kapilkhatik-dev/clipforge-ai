@@ -15,9 +15,15 @@ from yt_clipper import ContentType, DEFAULT_ANALYSIS_MODEL, LLMProvider
 from yt_clipper.domain.errors import AnalysisError
 from yt_clipper.domain.models import (
     ClipCandidate,
+    HighlightMoment,
     TranscriptDocument,
     TranscriptOrigin,
     TranscriptSegment,
+)
+from yt_clipper.services.analyzer import (
+    build_highlight_windows,
+    validate_highlight_montage,
+    validate_highlight_moments,
 )
 from yt_clipper.services.analyzer import (
     TranscriptAnalyzer,
@@ -501,7 +507,144 @@ def test_analyzer_retries_invalid_json_once() -> None:
     assert "AFTER [35.000 - 60.000]" in calls[2]["messages"][-1]["content"]
     assert result[0].title == "Good"
     assert result[0].standalone is True
-    assert result[0].opening_context
+
+
+def test_builds_four_second_transcript_backed_highlight_windows() -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=10,
+        segments=[
+            TranscriptSegment(start=0, end=3, text="First moment"),
+            TranscriptSegment(start=4, end=8, text="Second moment"),
+            TranscriptSegment(start=8, end=10, text="Final moment"),
+        ],
+    )
+
+    windows = build_highlight_windows(transcript, window_seconds=4)
+
+    assert [(item["start"], item["end"]) for item in windows] == [
+        (0.0, 4.0),
+        (4.0, 8.0),
+        (8.0, 10),
+    ]
+    assert windows[1]["text"] == "Second moment"
+
+
+def test_highlight_windows_slice_long_untimed_caption_text() -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=8,
+        segments=[
+            TranscriptSegment(
+                start=0,
+                end=8,
+                text="one two three four five six seven eight",
+            )
+        ],
+    )
+
+    windows = build_highlight_windows(transcript, window_seconds=4)
+
+    assert windows[0]["text"] == "one two three four"
+    assert windows[1]["text"] == "five six seven eight"
+
+
+def test_highlight_validation_rejects_invented_windows_and_bounds_montage() -> None:
+    windows = [
+        {"start": 0.0, "end": 4.0},
+        {"start": 8.0, "end": 12.0},
+        {"start": 20.0, "end": 24.0},
+    ]
+    moments = validate_highlight_moments(
+        [
+            {"start": 8, "end": 12, "score": 0.9, "hook": "B", "reason": "B"},
+            {"start": 1, "end": 5, "score": 1, "hook": "Bad", "reason": "Bad"},
+            {"start": 0, "end": 4, "score": 0.8, "hook": "A", "reason": "A"},
+            {"start": 20, "end": 24, "score": 0.7, "hook": "C", "reason": "C"},
+        ],
+        allowed_windows=windows,
+    )
+
+    montage = validate_highlight_montage(
+        {
+            "title": "Best moments",
+            "summary": "A varied highlight reel.",
+            "moments": [moment.model_dump() for moment in moments],
+        },
+        proposed_moments=moments,
+        max_duration=8,
+        max_moments=2,
+    )
+
+    assert [(item.start, item.end) for item in montage.moments] == [(8, 12), (0, 4)]
+    assert montage.duration == 8
+
+
+def test_highlight_montage_uses_batched_screening_and_global_review() -> None:
+    transcript = TranscriptDocument(
+        video_id="video",
+        language="en",
+        requested_language="en",
+        origin=TranscriptOrigin.MANUAL,
+        source_fingerprint="a" * 64,
+        duration_seconds=16,
+        segments=[
+            TranscriptSegment(start=index, end=index + 1, text=f"Moment {index}")
+            for index in range(16)
+        ],
+    )
+    responses = iter(
+        [
+            {
+                "choices": [{"message": {"content": json.dumps({"moments": [
+                    {"start": 0, "end": 4, "score": 0.8, "hook": "A", "reason": "A"},
+                    {"start": 4, "end": 8, "score": 0.9, "hook": "B", "reason": "B"},
+                ]})}}]
+            },
+            {
+                "choices": [{"message": {"content": json.dumps({"moments": [
+                    {"start": 8, "end": 12, "score": 0.95, "hook": "C", "reason": "C"},
+                    {"start": 12, "end": 16, "score": 0.7, "hook": "D", "reason": "D"},
+                ]})}}]
+            },
+            {
+                "choices": [{"message": {"content": json.dumps({
+                    "title": "The Best Bits",
+                    "summary": "All the strongest moments.",
+                    "moments": [
+                        {"start": 8, "end": 12, "score": 0.95, "hook": "C", "reason": "C"},
+                        {"start": 4, "end": 8, "score": 0.9, "hook": "B", "reason": "B"},
+                    ],
+                })}}]
+            },
+        ]
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_completion(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return next(responses)
+
+    montage = TranscriptAnalyzer(completion_fn=fake_completion).find_highlight_montage(
+        transcript,
+        model="test/model",
+        window_seconds=4,
+        max_duration=12,
+        max_moments=3,
+        batch_windows=2,
+    )
+
+    assert len(calls) == 3
+    assert montage.title == "The Best Bits"
+    assert [(item.start, item.end) for item in montage.moments] == [(8, 12), (4, 8)]
 
 
 def test_comedy_content_type_guides_both_existing_analysis_stages() -> None:

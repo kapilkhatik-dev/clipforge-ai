@@ -7,7 +7,11 @@ import pytest
 from yt_dlp.utils import RejectedVideoReached
 
 import yt_clipper.services.downloader as downloader_module
-from yt_clipper.domain.errors import DownloadError, DurationLimitError
+from yt_clipper.domain.errors import (
+    DownloadError,
+    DurationLimitError,
+    SourceTransferError,
+)
 from yt_clipper.domain.models import VideoMetadata
 from yt_clipper.infrastructure.media_tools import MediaProbe, MediaTools
 from yt_clipper.services.downloader import (
@@ -106,6 +110,8 @@ def test_rejects_local_remux_that_exceeds_size_limit(
 def test_download_filter_rejects_changed_over_limit_video_before_media_transfer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    download_attempts = 0
+
     class FakeYoutubeDL:
         def __init__(self, params):
             self.params = params
@@ -117,6 +123,8 @@ def test_download_filter_rejects_changed_over_limit_video_before_media_transfer(
             return None
 
         def extract_info(self, _url: str, download: bool):
+            nonlocal download_attempts
+            download_attempts += 1
             assert download is True
             assert self.params["max_filesize"] == 4 * 1024**3
             assert self.params["concurrent_fragment_downloads"] == 2
@@ -139,6 +147,7 @@ def test_download_filter_rejects_changed_over_limit_video_before_media_transfer(
 
     with pytest.raises(DurationLimitError, match="Nothing was downloaded"):
         downloader.download(metadata, tmp_path)
+    assert download_attempts == 1
     assert not (tmp_path / metadata.video_id / "source.mp4").exists()
 
 
@@ -153,6 +162,7 @@ def test_aggregate_stream_limit_cancels_download_and_removes_partials(
         duration_seconds=100,
     )
     partial_path = tmp_path / metadata.video_id / "source.video.part"
+    download_attempts = 0
 
     class FakeYoutubeDL:
         def __init__(self, params):
@@ -165,6 +175,8 @@ def test_aggregate_stream_limit_cancels_download_and_removes_partials(
             return None
 
         def extract_info(self, _url: str, download: bool):
+            nonlocal download_attempts
+            download_attempts += 1
             assert download is True
             partial_path.write_bytes(b"partial")
             progress = self.params["progress_hooks"][0]
@@ -200,7 +212,256 @@ def test_aggregate_stream_limit_cancels_download_and_removes_partials(
             maximum_download_bytes=100,
         )
 
+    assert download_attempts == 1
     assert not partial_path.exists()
+
+
+def test_download_prefers_avc_mp4_before_generic_adaptive_mp4(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    metadata = VideoMetadata(
+        video_id="abcdefghijk",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Test",
+        duration_seconds=100,
+    )
+    source_path = tmp_path / metadata.video_id / "source.mp4"
+    selectors: list[str] = []
+
+    class FakeYoutubeDL:
+        def __init__(self, params):
+            self.params = params
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, _url: str, download: bool):
+            assert download is True
+            selectors.append(self.params["format"])
+            source_path.write_bytes(b"downloaded")
+            return {"duration": 100}
+
+    monkeypatch.setattr(downloader_module, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(
+        downloader_module,
+        "probe_media",
+        lambda *_args: MediaProbe(
+            duration_seconds=100,
+            has_video=True,
+            has_audio=True,
+        ),
+    )
+    downloader = VideoDownloader(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+
+    downloader.download(metadata, tmp_path)
+
+    assert len(selectors) == 1
+    selector = selectors[0]
+    assert selector.index("[vcodec^=avc1]") < selector.index(
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+    )
+
+
+def test_download_retries_fresh_extraction_then_progressive_without_logging_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    metadata = VideoMetadata(
+        video_id="abcdefghijk",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Test",
+        duration_seconds=100,
+    )
+    source_path = tmp_path / metadata.video_id / "source.mp4"
+    selectors: list[str] = []
+
+    class FakeYoutubeDL:
+        def __init__(self, params):
+            self.params = params
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, _url: str, download: bool):
+            assert download is True
+            selectors.append(self.params["format"])
+            if len(selectors) <= 2:
+                raise downloader_module.YtDlpError(
+                    "HTTP Error 403 for https://signed.example.test/videoplayback?token=secret"
+                )
+            source_path.write_bytes(b"downloaded")
+            return {"duration": 100}
+
+    monkeypatch.setattr(downloader_module, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(
+        downloader_module,
+        "probe_media",
+        lambda *_args: MediaProbe(
+            duration_seconds=100,
+            has_video=True,
+            has_audio=True,
+        ),
+    )
+    downloader = VideoDownloader(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+
+    with caplog.at_level("WARNING", logger=downloader_module.__name__):
+        downloaded = downloader.download(metadata, tmp_path)
+
+    assert downloaded.video_path == source_path
+    assert len(selectors) == 3
+    assert "bestvideo" in selectors[0]
+    assert selectors[1] == selectors[0]
+    assert "bestvideo" not in selectors[2]
+    assert "[acodec!=none]" in selectors[2]
+    assert "signed.example.test" not in caplog.text
+    assert "token=secret" not in caplog.text
+
+
+def test_fresh_retry_removes_stale_partials_and_resets_size_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    metadata = VideoMetadata(
+        video_id="abcdefghijk",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Test",
+        duration_seconds=100,
+    )
+    work_dir = tmp_path / metadata.video_id
+    partial_path = work_dir / "source.video.part"
+    source_path = work_dir / "source.mp4"
+    download_attempts = 0
+
+    class FakeYoutubeDL:
+        def __init__(self, params):
+            self.params = params
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, _url: str, download: bool):
+            nonlocal download_attempts
+            download_attempts += 1
+            assert download is True
+            progress = self.params["progress_hooks"][0]
+            if download_attempts == 1:
+                partial_path.write_bytes(b"stale adaptive data")
+                progress(
+                    {
+                        "status": "downloading",
+                        "total_bytes": 60,
+                        "info_dict": {"format_id": "adaptive-video"},
+                    }
+                )
+                raise downloader_module.YtDlpError("HTTP Error 403")
+
+            assert not partial_path.exists()
+            progress(
+                {
+                    "status": "downloading",
+                    "total_bytes": 60,
+                    "info_dict": {"format_id": "progressive"},
+                }
+            )
+            source_path.write_bytes(b"downloaded")
+            return {"duration": 100}
+
+    monkeypatch.setattr(downloader_module, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(
+        downloader_module,
+        "probe_media",
+        lambda *_args: MediaProbe(
+            duration_seconds=100,
+            has_video=True,
+            has_audio=True,
+        ),
+    )
+    downloader = VideoDownloader(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+
+    downloaded = downloader.download(
+        metadata,
+        tmp_path,
+        maximum_download_bytes=100,
+    )
+
+    assert download_attempts == 2
+    assert downloaded.video_path == source_path
+    assert not partial_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("upstream_error", "expected_type"),
+    [
+        (
+            "HTTP Error 403 for "
+            "https://signed.example.test/videoplayback?token=private",
+            SourceTransferError,
+        ),
+        (
+            "ERROR: [youtube] abcdefghijk: Requested format is not available",
+            DownloadError,
+        ),
+    ],
+)
+def test_terminal_download_failure_distinguishes_transient_transfer_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    upstream_error: str,
+    expected_type: type[DownloadError],
+) -> None:
+    metadata = VideoMetadata(
+        video_id="abcdefghijk",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Test",
+        duration_seconds=100,
+    )
+    attempts = 0
+
+    class FakeYoutubeDL:
+        def __init__(self, params):
+            self.params = params
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, _url: str, download: bool):
+            nonlocal attempts
+            assert download is True
+            attempts += 1
+            raise downloader_module.YtDlpError(upstream_error)
+
+    monkeypatch.setattr(downloader_module, "YoutubeDL", FakeYoutubeDL)
+    downloader = VideoDownloader(
+        MediaTools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"))
+    )
+
+    with pytest.raises(DownloadError) as raised:
+        downloader.download(metadata, tmp_path)
+
+    assert attempts == 3
+    assert type(raised.value) is expected_type
+    assert "signed.example.test" not in str(raised.value)
+    assert "token=private" not in str(raised.value)
 
 
 def test_caches_normalized_original_youtube_thumbnail(

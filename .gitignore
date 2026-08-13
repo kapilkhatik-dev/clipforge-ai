@@ -28,6 +28,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.pytest-tmp-*/
 .mypy_cache/
 .ruff_cache/
 .pyright/
@@ -37,6 +38,11 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# React/Vite dependencies and generated frontend artifacts
+node_modules/
+web/dist/
+web/coverage/
 
 # Editors and operating-system metadata
 .idea/

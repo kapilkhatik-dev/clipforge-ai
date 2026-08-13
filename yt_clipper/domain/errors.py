@@ -13,6 +13,10 @@ class DownloadError(ClipperError):
     """Video inspection or download failed."""
 
 
+class SourceTransferError(DownloadError):
+    """A remote media transfer failed after safe retry/fallback attempts."""
+
+
 class DurationLimitError(DownloadError):
     """The source video exceeds the supported duration."""
 

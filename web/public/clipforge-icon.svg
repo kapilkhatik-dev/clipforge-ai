@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">ClipForge AI</title>
+  <rect width="64" height="64" rx="16" fill="#f5c84c"/>
+  <path d="M13 20.5 48.5 13a4 4 0 0 1 4.7 3.1l1.2 5.8-40.7 8.6-1.6-7.2a2.4 2.4 0 0 1 1.9-2.8Z" fill="#141821"/>
+  <path d="m21.8 18.6 6.9-1.5-4.8 8.3-6.9 1.5 4.8-8.3Zm15-3.2 6.9-1.4-4.8 8.3-6.9 1.4 4.8-8.3Z" fill="#f8e08d"/>
+  <path d="M14 30h40v20a5 5 0 0 1-5 5H19a5 5 0 0 1-5-5V30Z" fill="#141821"/>
+  <path d="M14 30h40v5H14z" fill="#242b38"/>
+  <path d="m29 39.2 12 6.8-12 6.8V39.2Z" fill="#f5c84c"/>
+</svg>

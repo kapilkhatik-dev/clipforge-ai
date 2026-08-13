@@ -141,14 +141,19 @@ def normalize_analysis_model(model: str) -> str:
     return normalized
 
 
-def resolve_analysis_model(provider: LLMProvider | str | None = None) -> str:
+def resolve_analysis_model(
+    provider: LLMProvider | str | None = None,
+    *,
+    include_common_overrides: bool = True,
+) -> str:
     """Return an explicit model override or the selected provider's default."""
     resolved_provider = (
         resolve_llm_provider() if provider is None else normalize_llm_provider(provider)
     )
-    configured = os.getenv("CLIPPER_LLM_MODEL", "").strip()
-    if configured:
-        return normalize_analysis_model(configured)
+    if include_common_overrides:
+        configured = os.getenv("CLIPPER_LLM_MODEL", "").strip()
+        if configured:
+            return normalize_analysis_model(configured)
 
     provider_model = os.getenv(
         _PROVIDER_MODEL_ENV_NAMES[resolved_provider],
@@ -157,13 +162,18 @@ def resolve_analysis_model(provider: LLMProvider | str | None = None) -> str:
     if provider_model:
         return normalize_analysis_model(provider_model)
 
-    legacy_model = os.getenv("CLIPPER_MODEL", "").strip()
-    if legacy_model:
-        return normalize_analysis_model(legacy_model)
+    if include_common_overrides:
+        legacy_model = os.getenv("CLIPPER_MODEL", "").strip()
+        if legacy_model:
+            return normalize_analysis_model(legacy_model)
     return default_analysis_model(resolved_provider)
 
 
-def resolve_llm_api_key(provider: LLMProvider | str | None = None) -> str | None:
+def resolve_llm_api_key(
+    provider: LLMProvider | str | None = None,
+    *,
+    include_common_overrides: bool = True,
+) -> str | None:
     """Resolve the shared key, falling back to legacy provider variables."""
     resolved_provider = (
         resolve_llm_provider() if provider is None else normalize_llm_provider(provider)
@@ -171,9 +181,10 @@ def resolve_llm_api_key(provider: LLMProvider | str | None = None) -> str | None
     if resolved_provider == LLMProvider.CODEX:
         return None
 
-    common_key = os.getenv("CLIPPER_LLM_API_KEY", "").strip()
-    if common_key:
-        return common_key
+    if include_common_overrides:
+        common_key = os.getenv("CLIPPER_LLM_API_KEY", "").strip()
+        if common_key:
+            return common_key
 
     for variable_name in _PROVIDER_API_KEY_ENV_NAMES[resolved_provider]:
         provider_key = os.getenv(variable_name, "").strip()

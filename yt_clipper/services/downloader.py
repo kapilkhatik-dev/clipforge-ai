@@ -20,7 +20,12 @@ from yt_dlp import YoutubeDL
 from yt_dlp.cookies import SUPPORTED_BROWSERS, SUPPORTED_KEYRINGS
 from yt_dlp.utils import YoutubeDLError as YtDlpError
 
-from ..domain.errors import DownloadError, DurationLimitError, MediaProbeError
+from ..domain.errors import (
+    DownloadError,
+    DurationLimitError,
+    MediaProbeError,
+    SourceTransferError,
+)
 from ..domain.models import (
     MAX_SOURCE_DURATION_SECONDS,
     DownloadedVideo,
@@ -33,6 +38,22 @@ DownloadProgressHook = Callable[[dict[str, Any]], None]
 _YOUTUBE_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _LOCAL_VIDEO_EXTENSIONS = frozenset({".m4v", ".mkv", ".mov", ".mp4", ".webm"})
 _MAX_THUMBNAIL_DOWNLOAD_BYTES = 10 * 1024**2
+_ADAPTIVE_MP4_FORMAT = (
+    "bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+    "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+)
+_PROGRESSIVE_MP4_FORMAT = (
+    "best[height<=1080][ext=mp4][vcodec^=avc1][acodec!=none]/"
+    "best[height<=1080][ext=mp4][vcodec!=none][acodec!=none]"
+)
+_TRANSIENT_TRANSFER_ERROR = re.compile(
+    r"(?:"
+    r"http error\s+(?:403|408|425|429|5\d\d)\b|"
+    r"\b(?:connection (?:aborted|reset)|network is unreachable|remote end closed)\b|"
+    r"\b(?:temporary failure|temporarily unavailable|timed?\s*out)\b"
+    r")",
+    re.IGNORECASE,
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -63,6 +84,11 @@ def validate_youtube_video_id(video_id: str) -> str:
     if not _YOUTUBE_VIDEO_ID.fullmatch(video_id):
         raise DownloadError("YouTube returned an invalid video identifier.")
     return video_id
+
+
+def _is_transient_transfer_error(error: BaseException) -> bool:
+    """Classify retryable transport failures without exposing upstream details."""
+    return _TRANSIENT_TRANSFER_ERROR.search(str(error)) is not None
 
 
 def resolve_local_video_path(value: str) -> Path | None:
@@ -467,91 +493,138 @@ class VideoDownloader:
                 thumbnail_path=thumbnail_path,
             )
 
-        duration_rejection: list[DownloadError] = []
-        size_rejection: list[DownloadError] = []
-        downloaded_by_file: dict[str, int] = {}
-
-        def duration_filter(info: dict[str, Any], *, incomplete: bool) -> str | None:
-            if incomplete and info.get("duration") is None:
-                return None
-            try:
-                validate_source_duration(
-                    info.get("duration"),
-                    maximum_seconds=maximum_duration_seconds,
-                )
-            except DownloadError as exc:
-                duration_rejection.append(exc)
-                return str(exc)
-            return None
-
-        def bounded_progress(status: dict[str, Any]) -> None:
-            if status.get("status") in {"downloading", "finished"}:
-                info = status.get("info_dict")
-                format_id = info.get("format_id") if isinstance(info, dict) else None
-                transfer_key = str(
-                    format_id
-                    or status.get("filename")
-                    or status.get("tmpfilename")
-                    or "download"
-                )
-                transferred = max(
-                    int(status.get("downloaded_bytes") or 0),
-                    int(status.get("total_bytes") or 0),
-                    int(status.get("total_bytes_estimate") or 0),
-                )
-                downloaded_by_file[transfer_key] = max(
-                    downloaded_by_file.get(transfer_key, 0),
-                    transferred,
-                )
-                if sum(downloaded_by_file.values()) > maximum_download_bytes:
-                    error = DownloadError(
-                        "Downloaded streams exceed the configured source-size limit."
-                    )
-                    size_rejection.append(error)
-                    raise error
-            if progress_hook:
-                progress_hook(status)
-
-        options = self._common_options(cookies_from_browser)
-        options.update(
-            {
-                "format": (
-                    "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-                    "best[height<=1080][ext=mp4]"
-                ),
-                "outtmpl": str(work_dir / "source.%(ext)s"),
-                "merge_output_format": "mp4",
-                "ffmpeg_location": self._media_tools.yt_dlp_location,
-                "overwrites": force,
-                "continuedl": True,
-                "noprogress": True,
-                "match_filter": duration_filter,
-                "break_on_reject": True,
-                "max_filesize": maximum_download_bytes,
-                "concurrent_fragment_downloads": 2,
-            }
-        )
-        options["progress_hooks"] = [bounded_progress]
-
-        try:
-            with YoutubeDL(options) as ydl:  # pyright: ignore[reportArgumentType]
-                downloaded_info = ydl.extract_info(metadata.source_url, download=True)
-        except (YtDlpError, DownloadError) as exc:
+        def clean_source_files() -> None:
             for partial in work_dir.glob("source.*"):
                 if partial.is_file():
                     partial.unlink(missing_ok=True)
-            if duration_rejection:
-                raise duration_rejection[-1] from exc
-            if size_rejection:
-                raise size_rejection[-1] from exc
-            if isinstance(exc, DownloadError):
-                raise
-            raise DownloadError(f"Video download failed: {exc}") from exc
 
-        if duration_rejection:
-            raise duration_rejection[-1]
-        if size_rejection:
-            raise size_rejection[-1]
+        def download_attempt(format_selector: str) -> dict[str, Any] | None:
+            # These collections are deliberately per-attempt. A failed transfer
+            # must not make a clean subsequent retry look oversized.
+            duration_rejection: list[DownloadError] = []
+            size_rejection: list[DownloadError] = []
+            downloaded_by_file: dict[str, int] = {}
+
+            def duration_filter(
+                info: dict[str, Any], *, incomplete: bool
+            ) -> str | None:
+                if incomplete and info.get("duration") is None:
+                    return None
+                try:
+                    validate_source_duration(
+                        info.get("duration"),
+                        maximum_seconds=maximum_duration_seconds,
+                    )
+                except DownloadError as exc:
+                    duration_rejection.append(exc)
+                    return str(exc)
+                return None
+
+            def bounded_progress(status: dict[str, Any]) -> None:
+                if status.get("status") in {"downloading", "finished"}:
+                    info = status.get("info_dict")
+                    format_id = (
+                        info.get("format_id") if isinstance(info, dict) else None
+                    )
+                    transfer_key = str(
+                        format_id
+                        or status.get("filename")
+                        or status.get("tmpfilename")
+                        or "download"
+                    )
+                    transferred = max(
+                        int(status.get("downloaded_bytes") or 0),
+                        int(status.get("total_bytes") or 0),
+                        int(status.get("total_bytes_estimate") or 0),
+                    )
+                    downloaded_by_file[transfer_key] = max(
+                        downloaded_by_file.get(transfer_key, 0),
+                        transferred,
+                    )
+                    if sum(downloaded_by_file.values()) > maximum_download_bytes:
+                        error = DownloadError(
+                            "Downloaded streams exceed the configured source-size limit."
+                        )
+                        size_rejection.append(error)
+                        raise error
+                if progress_hook:
+                    progress_hook(status)
+
+            options = self._common_options(cookies_from_browser)
+            options.update(
+                {
+                    "format": format_selector,
+                    "outtmpl": str(work_dir / "source.%(ext)s"),
+                    "merge_output_format": "mp4",
+                    "ffmpeg_location": self._media_tools.yt_dlp_location,
+                    "overwrites": force,
+                    "continuedl": True,
+                    "noprogress": True,
+                    "match_filter": duration_filter,
+                    "break_on_reject": True,
+                    "max_filesize": maximum_download_bytes,
+                    "concurrent_fragment_downloads": 2,
+                }
+            )
+            options["progress_hooks"] = [bounded_progress]
+
+            try:
+                with YoutubeDL(options) as ydl:  # pyright: ignore[reportArgumentType]
+                    downloaded_info = ydl.extract_info(
+                        metadata.source_url, download=True
+                    )
+            except (YtDlpError, DownloadError) as exc:
+                clean_source_files()
+                if duration_rejection:
+                    raise duration_rejection[-1] from exc
+                if size_rejection:
+                    raise size_rejection[-1] from exc
+                raise
+
+            if duration_rejection:
+                clean_source_files()
+                raise duration_rejection[-1]
+            if size_rejection:
+                clean_source_files()
+                raise size_rejection[-1]
+            return downloaded_info
+
+        attempt_formats = (
+            _ADAPTIVE_MP4_FORMAT,
+            _ADAPTIVE_MP4_FORMAT,
+            _PROGRESSIVE_MP4_FORMAT,
+        )
+        downloaded_info: dict[str, Any] | None = None
+        for attempt_index, format_selector in enumerate(attempt_formats):
+            try:
+                downloaded_info = download_attempt(format_selector)
+                break
+            except DownloadError:
+                # Duration and aggregate-size failures are policy decisions, not
+                # transport failures, so another format must not bypass them.
+                raise
+            except YtDlpError as exc:
+                # Discard partial streams and create a new YoutubeDL instance so
+                # extraction cannot reuse an expired signed media URL.
+                clean_source_files()
+                if attempt_index == 0:
+                    LOGGER.warning(
+                        "Adaptive MP4 download failed; retrying with fresh media URLs."
+                    )
+                    continue
+                if attempt_index == 1:
+                    LOGGER.warning(
+                        "Adaptive MP4 retry failed; trying a progressive MP4 format."
+                    )
+                    continue
+                if _is_transient_transfer_error(exc):
+                    raise SourceTransferError(
+                        "Video download failed with both adaptive and progressive MP4 formats."
+                    ) from exc
+                raise DownloadError(
+                    "Video download failed after all supported MP4 formats were attempted."
+                ) from exc
+
         if downloaded_info:
             try:
                 validate_source_duration(

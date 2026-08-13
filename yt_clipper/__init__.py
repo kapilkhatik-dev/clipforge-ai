@@ -17,6 +17,7 @@ from .domain.errors import (
     MediaExtractionError,
     MediaProbeError,
     RenderError,
+    SourceTransferError,
     TranscriptError,
 )
 from .domain.models import (
@@ -58,6 +59,7 @@ __all__ = [
     "PipelineStage",
     "ProgressCallback",
     "RenderError",
+    "SourceTransferError",
     "TranscriptDocument",
     "TranscriptError",
     "TranscriptMode",

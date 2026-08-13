@@ -1,6 +1,6 @@
-# YouTube Clipper
+# ClipForge AI
 
-A framework-neutral Python pipeline that downloads one YouTube video, obtains a timestamped transcript, asks a configured AI backend for strong short-form moments, and renders vertical captioned clips with FFmpeg. Analysis can use the locally installed Codex CLI with saved ChatGPT authentication or a LiteLLM-supported API provider. By default, it exports every high-quality clip that survives final review (up to the 20-candidate safety ceiling); callers can instead provide `clip_count=N` to export at most N clips.
+A polished local React workbench and framework-neutral Python pipeline that download one YouTube video, obtain a timestamped transcript, ask a configured AI backend for strong short-form moments, and render vertical captioned clips with FFmpeg. Analysis can use the locally installed Codex CLI with saved ChatGPT authentication or a LiteLLM-supported API provider. By default, it exports every high-quality clip that survives final review (up to the 20-candidate safety ceiling); users can instead request at most N clips.
 
 The current release processes complete source videos whose YouTube metadata duration is up to **1 hour (3,600 seconds)**. `PipelineConfig` can impose a lower limit, but the application-wide content ceiling cannot be raised above one hour. Duration is checked during metadata inspection, enforced again inside yt-dlp before transfer, and verified on cached or downloaded media with FFprobe. Up to five seconds of mux/container padding is tolerated around otherwise valid metadata; transcript and clip timestamps remain bounded to the metadata duration. Downloads remain limited to <=1080p MP4, and the final source plus aggregate reported stream transfer are limited to **4 GiB** by default.
 
@@ -24,15 +24,19 @@ yt_clipper/
 │   ├── analyzer.py                  Provider-neutral selection and validation
 │   ├── codex_cli.py                 Structured local Codex CLI integration
 │   └── renderer.py                  ASS captions and FFmpeg clip rendering
-└── infrastructure/
-    ├── artifacts.py                 Atomic writes and fingerprints
-    └── media_tools.py               FFmpeg discovery, probing, and checks
+├── infrastructure/
+│   ├── artifacts.py                 Atomic writes and fingerprints
+│   └── media_tools.py               FFmpeg discovery, probing, and checks
+└── webapi/                          Local FastAPI, jobs, providers, SSE, assets
+web/                                 React, TypeScript, and Vite workbench
+docs/ui-architecture.md              UX, Stitch direction, and editor boundary
 tests/                               Offline unit tests
 requirements.txt                     Runtime dependencies
 requirements-dev.txt                 Development and test dependencies
 ```
 
-`main.py` is only a development adapter. The package does not print, parse command-line arguments, or depend on a frontend framework. A future Streamlit, NiceGUI, API, or desktop adapter can import the same application service without refactoring the pipeline.
+`main.py` remains a development adapter. The React application talks to a thin
+FastAPI layer, while both adapters reuse the same framework-neutral `ClipPipeline`.
 
 ## LLM provider configuration
 
@@ -95,6 +99,9 @@ These are all user-configurable environment variables read by the application
 | `ANTHROPIC_API_KEY` | Anthropic only | Anthropic credential fallback |
 | `CLIPPER_CODEX_BINARY` | No; defaults to `codex` | Codex executable command or absolute path |
 | `CLIPPER_CODEX_TIMEOUT_SECONDS` | No; defaults to `300` | Per-request Codex timeout, from 30 to 1,800 seconds |
+| `CLIPPER_WEB_PORT` | No; defaults to `8787` | Loopback port used by the local FastAPI/production React server |
+| `CLIPPER_WEB_MAX_WORKERS` | No; defaults to `1`, capped at `4` | Maximum concurrent local generation workers; increase only after measuring system resources |
+| `CLIPPER_WEB_ALLOWED_HOSTS` | No | Comma-separated additional trusted Host header values for an intentional local reverse proxy |
 | `FFMPEG_HOME` | Only when FFmpeg is not discoverable | Directory containing both FFmpeg and FFprobe |
 | `FFMPEG_BINARY`, `FFPROBE_BINARY` | No | Individual media-tool command or path overrides |
 | `CLIPPER_MODEL` | No | Deprecated model override retained for compatibility |
@@ -439,6 +446,7 @@ Use a smaller `max_source_duration_seconds` or `max_source_download_bytes` when 
 ## Prerequisites
 
 - Python 3.11 or newer
+- Node.js 20.19 or newer (or 22.12 or newer) for the React workbench
 - FFmpeg and FFprobe with `libx264`, AAC, blur, overlay, and `subtitles`/libass support
 - Either a signed-in local Codex CLI (`codex login`) or an API key from [NVIDIA](https://build.nvidia.com/settings/api-keys), [OpenRouter](https://openrouter.ai/settings/keys), [OpenAI](https://platform.openai.com/api-keys), or [Anthropic](https://console.anthropic.com/settings/keys)
 
@@ -489,6 +497,103 @@ OPENROUTER_API_KEY=replace-with-your-openrouter-key
 For the default NVIDIA route, LiteLLM uses `https://integrate.api.nvidia.com/v1`. Other API endpoints or the local Codex subprocess path are selected automatically from `CLIPPER_LLM_PROVIDER`.
 
 `.env`, `.venv`, downloaded media, and generated outputs are ignored by Git. `.env.example` contains placeholders only and can remain tracked.
+
+## Run the React workbench
+
+The web application is intentionally focused on one primary **Create clips**
+workbench. It provides source entry, an AI recipe, real pipeline progress,
+montage-first results, previews, and downloads. Provider and model configuration
+is supplied through `.env`; the unused browser Settings page has been removed.
+
+The project and clip routes are stable now so a non-destructive timeline editor
+can be added later without reorganizing the application. See
+[the UI architecture](docs/ui-architecture.md) for the complete design boundary
+and the reviewed Google Stitch direction.
+
+For production-style local use, install the locked frontend packages, build the
+bundle, and start the Python server:
+
+```powershell
+Set-Location web
+npm ci
+npm run build
+Set-Location ..
+.venv\Scripts\python.exe -m yt_clipper.webapi
+```
+
+Open <http://127.0.0.1:8787>. The API binds only to loopback. A built `web/dist`
+bundle is served by FastAPI with history fallback for refresh-safe React routes.
+
+For frontend development, use two terminals:
+
+```powershell
+# Terminal 1, from the repository root
+.venv\Scripts\python.exe -m yt_clipper.webapi
+
+# Terminal 2
+Set-Location web
+npm ci
+npm run dev
+```
+
+Open <http://127.0.0.1:5173>. Vite proxies `/api` to the loopback server on port
+8787, so no cross-origin configuration is required. If `CLIPPER_WEB_PORT` changes,
+update the Vite proxy target as well. Keep API requests behind this same-origin
+proxy; the server intentionally does not enable wildcard CORS.
+
+Provider values supplied in `.env` are resolved by the local Python service and
+are never returned to React. Change the provider/model/key values in `.env` and
+restart the service to switch configurations. The provider APIs retain their
+write-only secret and readiness boundaries for programmatic clients. An explicit
+`POST /api/v1/provider-profiles/<profile-id>/test?live=true` performs one
+timeout-bounded request to the selected model and may incur provider charges; its
+sanitized result does not expose credentials or silently activate a profile.
+
+Provider definitions still own their field types, constraints, write-only/clear
+behavior, model prefix, environment resolution, and translation into
+`PipelineConfig`. New analysis transports require a Python adapter; the Create UI
+consumes only the normalized active-profile/readiness contract.
+
+Project records, job status, completed results, progress history, and opaque asset
+IDs are stored in a versioned SQLite database at
+`output/_web_state/clipforge.sqlite3`. No provider API key or complete
+`PipelineConfig` is written to that database. A completed project URL can therefore
+be reopened after restarting the local service. A job that was queued or running
+when the process stopped is restored as failed with a restart-specific message;
+start a new generation to retry it.
+
+The Create page lists recent non-empty projects through the bounded, cursor-based
+`GET /api/v1/projects` index. Each card contains only a compact latest-generation
+summary; opening it restores the project and exposes a selector for all of that
+source's generation runs. If generation submission fails after creating a draft,
+the empty project is removed. Deleting the last job also prunes its project.
+
+The API retains at most 512 recent progress events per job and coalesces duplicate
+percentage updates. Generation-owned snapshots remain available until explicitly
+deleted. `DELETE /api/v1/jobs/<job-id>` removes a terminal job and its public
+snapshot; active jobs return `409`. Local maintenance tools can apply an age/count
+policy with `POST /api/v1/maintenance/retention`, for example
+`{"maxAgeDays": 30, "maxJobs": 100}`. Core source/transcript caches are preserved
+so later runs can still reuse them.
+
+Snapshot deletion is recoverable: ClipForge first renames a job export directory
+to a hidden tombstone, commits the database deletion, then removes the tombstone.
+A database failure restores the snapshot and its opaque asset mappings; startup
+reconciles any tombstone left by an interrupted cleanup. Manual deletion and
+retention are serialized so concurrent maintenance cannot corrupt job state.
+
+`GET /api/v1/system/diagnostics` reports sanitized FFmpeg, FFprobe, output-disk,
+and provider-readiness status without returning executable paths, credentials, or
+upstream response bodies. Hosted-provider readiness confirms local configuration;
+it intentionally avoids a billable model request. Use the explicit live test above
+only when end-to-end credential and model access needs to be verified.
+
+Every newly generated clip and montage also carries a versioned
+`editDecisionList` in its persisted job result. It records the source video ID,
+layout, caption preset, and ordered source ranges. Continuous clips contain one
+range; montages preserve every selected moment in playback order. This is the
+non-destructive handoff for the planned editor, so editing can create a new version
+without mutating an existing MP4.
 
 ## Run and debug directly
 
@@ -600,7 +705,7 @@ safe area. Poster caching is independent from video
 rendering, so adding or refreshing the vertical artwork does not re-encode a valid
 MP4 or change its embedded horizontal preview.
 
-## Frontend integration
+## Python integration
 
 Use the package's public API rather than importing `main.py`:
 
@@ -634,13 +739,20 @@ pipeline = ClipPipeline(
 result = pipeline.run("https://www.youtube.com/watch?v=...")
 ```
 
-The callback and result are typed Pydantic contracts. A frontend can pass its provider selector and, for API providers, a secret-input value as `llm_provider` and `llm_api_key`; the key is stored as Pydantic `SecretStr` and excluded from representation and serialization. Codex mode needs no secret-input value. Per-video file locks protect artifacts when a future frontend starts concurrent jobs.
+The callback and result are typed Pydantic contracts. Another adapter can pass its
+provider selector and, for API providers, a secret-input value as `llm_provider`
+and `llm_api_key`; the key is stored as Pydantic `SecretStr` and excluded from
+representation and serialization. Codex mode needs no secret-input value.
 
 ## Output
 
 ```text
 output/
 ├── .whisper.lock
+├── _web_state/
+│   └── clipforge.sqlite3
+├── _web_jobs/
+│   └── <job-id>/
 └── <video-id>/
     ├── metadata.json
     ├── source.mp4
@@ -658,7 +770,7 @@ output/
     └── temp/
 ```
 
-Each MP4 in `clips/` has matching `.thumbnail.jpg`, `.poster.jpg`, and `.render.json` files. `output/.whisper.lock` is created only when local Whisper is used, and the number of chunk-analysis files depends on transcript size, up to the 64-chunk safety limit. Source media, the original thumbnail, transcripts, analysis, rendered clips, and titled artwork are fingerprinted or probed before reuse. The inexpensive source fingerprint includes file size, modification time, and the first and last MiB; Whisper cache fingerprints also include its processing options, while final analysis cache validation includes the prompt and chunk configuration. Video layout and horizontal thumbnail design are part of the render fingerprint, while vertical posters have an independent fingerprint. JSON, JPEG, and final MP4 artifacts are written transactionally, stale managed clips and artwork are removed after a successful render, and `PipelineConfig(force=True)` recreates the complete pipeline.
+Each MP4 in `clips/` has matching `.thumbnail.jpg`, `.poster.jpg`, and `.render.json` files. Web generations also copy their public video and image assets into `output/_web_jobs/<job-id>/` before publishing opaque download URLs. These generation-owned snapshots keep an earlier result stable when the same source is processed again, while the SQLite state database restores their IDs after a service restart. Snapshots are not removed automatically unless the retention endpoint is used. `output/.whisper.lock` is created only when local Whisper is used, and the number of chunk-analysis files depends on transcript size, up to the 64-chunk safety limit. Source media, the original thumbnail, transcripts, analysis, rendered clips, and titled artwork are fingerprinted or probed before reuse. The inexpensive source fingerprint includes file size, modification time, and the first and last MiB; Whisper cache fingerprints also include its processing options, while final analysis cache validation includes the prompt and chunk configuration. Video layout and horizontal thumbnail design are part of the render fingerprint, while vertical posters have an independent fingerprint. JSON, JPEG, and final MP4 artifacts are written transactionally, stale managed clips and artwork are removed after a successful render, and `PipelineConfig(force=True)` recreates the complete pipeline.
 
 ## Validation
 
@@ -668,6 +780,12 @@ Offline validation does not download YouTube videos or call model APIs:
 .venv\Scripts\python.exe -m pytest
 .venv\Scripts\python.exe -m compileall -q main.py yt_clipper tests
 .venv\Scripts\python.exe -m pip check
+
+Set-Location web
+npm run typecheck
+npm run lint
+npm test
+npm run build
 ```
 
 ## Privacy, cost, and permitted use
